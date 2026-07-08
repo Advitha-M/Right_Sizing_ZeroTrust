@@ -1,0 +1,68 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: zt-lab
+# -----------------------------------------------------------------------------
+# Rev6 correction vs the pre-v6 version of this file:
+#   Worker node labels now use the v6 canonical tenant names from
+#   Driver/constants.py (TENANTS) — tenant-lowpriv / tenant-finserv /
+#   tenant-partner / tenant-saas. The old acme/globex/initech/umbrella naming
+#   is retired repo-wide (see harness/config.env) and must not be reintroduced
+#   here. Controls/c4-tenant-isolation/apply.sh discovers nodes via
+#   `kubectl get nodes -l tenant -o jsonpath='...labels.tenant'`, so the label
+#   KEY must stay "tenant" and the VALUE must be one of the four names below
+#   — apply.sh will hard-fail with "No node found with label tenant=<name>"
+#   if these drift.
+#
+# L2 (cluster access control) is the sole always-active base layer (v6
+# Section 1): it is baked into the kube-apiserver static manifest at cluster
+# bootstrap via the audit-policy wiring below, not toggled by any Controls/
+# script. Only the audit-logging half of L2 is implementable this way; see
+# infra/audit/audit-policy.yaml's header for what's out of scope on a local
+# KIND substrate (no OIDC issuer, no private endpoint concept).
+#
+# Cilium is NOT installed by this file (disableDefaultCNI only prepares the
+# cluster for it) and there is no Makefile in this repo to do it either —
+# install it explicitly as part of infra/setup.sh's phase1 (added — see that
+# file), pinned to the version the Tier-1 invariant check expects:
+#   helm install cilium cilium/cilium --version 1.19.3 --namespace kube-system
+# -----------------------------------------------------------------------------
+networking:
+  disableDefaultCNI: true
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            audit-policy-file: "/etc/kubernetes/policies/audit-policy.yaml"
+            audit-log-path: "/var/log/kubernetes/audit.log"
+            audit-log-maxsize: "100"
+            audit-log-maxbackup: "5"
+          extraVolumes:
+            - name: audit-policies
+              hostPath: "/etc/kubernetes/policies"
+              mountPath: "/etc/kubernetes/policies"
+              readOnly: true
+              pathType: "DirectoryOrCreate"
+            - name: audit-logs
+              hostPath: "/var/log/kubernetes"
+              mountPath: "/var/log/kubernetes"
+              readOnly: false
+              pathType: DirectoryOrCreate
+    extraMounts:
+      - hostPath: ./infra/audit/
+        containerPath: /etc/kubernetes/policies
+  # One dedicated worker per tenant node pool (v6 Section 13: 5-node cluster,
+  # 1 shared system pool [this control-plane node] + 4 user pools, one per
+  # tenant). Controls/c4-tenant-isolation/apply.sh taints these
+  # `tenant=<name>:NoSchedule` when L4 is toggled on — that taint is applied
+  # at runtime, not baseline, so it's deliberately absent here.
+  - role: worker
+    labels: { tenant: tenant-lowpriv }
+  - role: worker
+    labels: { tenant: tenant-finserv }
+  - role: worker
+    labels: { tenant: tenant-partner }
+  - role: worker
+    labels: { tenant: tenant-saas }

@@ -248,7 +248,7 @@ def superadditivity_test(conn, la, lb, attack_class, shapley_draw_list, run_id):
         return {"note": "unavailable -- (L2,L3a) separation sampler not implemented "
                          "(see samplers.py); no superadditivity test possible with "
                          "current data."}
-    from analysis_common import wilcoxon_p, rank_biserial_matched, is_detected, latency, paired_by_trial, ALPHA, COHENS_H_MIN  # noqa: E501
+    from analysis_common import wilcoxon_p, rank_biserial_matched, is_detected, latency, paired_by_trial, BONFERRONI_ALPHA, COHENS_H_MIN  # noqa: E501
     valid_techs = dl_valid_techniques(pk, attack_class)
     out = {}
     r_draws = robustness_draws((la, lb), run_id)
@@ -272,7 +272,7 @@ def superadditivity_test(conn, la, lb, attack_class, shapley_draw_list, run_id):
         y = [latency(r) for r in pb]
         p = wilcoxon_p(x, y)
         r_eff = rank_biserial_matched(x, y)
-        confirmed = (dl_joint < solo_best) and (p < ALPHA) and (abs(r_eff) >= COHENS_H_MIN)
+        confirmed = (dl_joint < solo_best) and (p < BONFERRONI_ALPHA) and (abs(r_eff) >= COHENS_H_MIN)
         out[t] = {"confirmed": bool(confirmed), "solo_best": solo_best, "dl_joint": dl_joint,
                    "p": p, "effect_r": r_eff, "n_pairs": len(pa)}
     return out

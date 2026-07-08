@@ -4,12 +4,12 @@
 # ----------------------------------------------------------------------------
 #  Rewritten against the actual v6-corrected repo layout: Attacks/, Controls/
 #  (c1-l1, c2-rbac, c3-opa, c4-tenant-isolation, c5-networkpolicy, c6-istio,
-#  c7-vault), Driver/, harness/. The old repo generation this was based on
+#  c7-vault), Driver/, Harness/. The old repo generation this was based on
 #  used lowercase attacks/controls/tenants dirs and acme/globex/initech/
 #  umbrella tenant namespaces — none of that exists here. Tenant namespaces
 #  are the four names in Driver/constants.TENANTS: tenant-lowpriv,
 #  tenant-finserv, tenant-partner, tenant-saas. Do not reintroduce the old
-#  naming (see harness/config.env's explicit note on this).
+#  naming (see Harness/config.env's explicit note on this).
 #
 #  Usage:
 #     sudo -v                 # cache your password ONCE
@@ -35,13 +35,13 @@
 #     a richer v3 schema (run_id, doc_class, technique_token, t_start, t_end,
 #     t_alert, alert_source, exit_code, error_type, target_tenant,
 #     pivot_path). driver.py's own header comment calls out exactly this
-#     failure mode in the old harness/run_attacks.sh ("wrote a thinner DB
+#     failure mode in the old Harness/run_attacks.sh ("wrote a thinner DB
 #     schema than driver.py's — despite a comment claiming it was
 #     schema-compatible") — Phase 3 avoids repeating it by not touching the
 #     schema at all and letting driver.py own it exclusively.
 #   * Phase 4 marks Attacks/*.sh executable (flat directory — no
 #     attacks/wrappers/ or attacks/oracles/ subdirs in this repo; see
-#     harness/config.env's note that those don't exist here).
+#     Harness/config.env's note that those don't exist here).
 #   * Phase 5 is functionally unchanged (Istio/Gatekeeper/Vault, installed
 #     but not enforcing) — Controls/c1-l1, c3-opa, c6-istio, and c7-vault
 #     apply.sh scripts all explicitly assume this phase already ran.
@@ -165,7 +165,7 @@ phase3(){
   step "Ensuring results/ directory exists (schema owned by Driver/driver.py)"
   mkdir -p "${REPO_ROOT}/results"
   echo "       results.db is created/migrated by Driver/driver.py's init_db()"
-  echo "       on first run (harness/run_attacks.sh or driver.py directly)."
+  echo "       on first run (Harness/run_attacks.sh or driver.py directly)."
   echo "       Deliberately NOT hand-creating a trials table here — see this"
   echo "       file's header comment for why the old version's schema drift"
   echo "       bug is being avoided rather than reintroduced."
@@ -184,7 +184,7 @@ phase4(){
   chmod +x "${REPO_ROOT}"/Attacks/*.sh \
            "${REPO_ROOT}"/Controls/*/apply.sh \
            "${REPO_ROOT}"/Controls/*/remove.sh \
-           "${REPO_ROOT}"/harness/*.sh 2>/dev/null || true
+           "${REPO_ROOT}"/Harness/*.sh 2>/dev/null || true
 
   step "Installing Stratus Red Team (optional — Attacks/stratus_adapter.sh degrades to native if absent)"
   URL=$(curl -s https://api.github.com/repos/DataDog/stratus-red-team/releases/latest \
@@ -303,7 +303,7 @@ verify(){
 
   echo "----- Baseline behaviour : all 7 attacks should SUCCEED at C0 -----"
   if [ -f "${REPO_ROOT}/Driver/config.py" ]; then
-    STACK_ID=C0 N_TRIALS=1 bash "${REPO_ROOT}/harness/run_attacks.sh" 2>/dev/null | grep -E "attack[0-9]" || true
+    STACK_ID=C0 N_TRIALS=1 bash "${REPO_ROOT}/Harness/run_attacks.sh" 2>/dev/null | grep -E "attack[0-9]" || true
     S=$(sqlite3 "${REPO_ROOT}/results/results.db" \
           "SELECT COUNT(*) FROM trials WHERE config='C0' AND success=1;" 2>/dev/null)
     [ "${S:-0}" -ge 7 ] && ok "all 7 attacks SUCCEED at baseline (C0 correctly wide-open)" \

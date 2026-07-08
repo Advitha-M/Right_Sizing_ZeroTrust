@@ -24,7 +24,7 @@ from constants import (
     CONFIGS, CONDITION_ORDER, ATTACK_ORDER_DOCS,
     TECHNIQUE_SETS, TECHNIQUE_MIN_CONDITION,
     CONSTRAINED_PAIRS_ASR, DL_CANDIDATE_PAIRS,
-    ALPHA, COHENS_H_MIN,
+    BONFERRONI_ALPHA, COHENS_H_MIN,
 )
 
 ATTACK_CLASSES = ATTACK_ORDER_DOCS  # ["A1".."A7"]
@@ -232,8 +232,9 @@ def wilcoxon_p(x, y):
 
 
 def gated_delta_asr(rows_prev, rows_curr):
-    """DeltaASR = ASR(prev) - ASR(curr), gated: McNemar p<0.05/7 AND
-    |Cohen's h|>=0.20 (Section 6), else forced to zero. Paired by trial#."""
+    """DeltaASR = ASR(prev) - ASR(curr), gated: McNemar p<0.05/7 (Bonferroni-
+    corrected over the 7 attack classes, Section 6) AND |Cohen's h|>=0.20,
+    else forced to zero. Paired by trial#."""
     p_prev, p_curr = asr(rows_prev), asr(rows_curr)
     if p_prev is None or p_curr is None:
         return {"delta": None, "significant": False, "p": None, "effect_h": None,
@@ -247,14 +248,15 @@ def gated_delta_asr(rows_prev, rows_curr):
     p = mcnemar_exact_p(x, y)
     h = cohens_h(p_prev, p_curr)
     raw_delta = p_prev - p_curr
-    significant = (p < ALPHA) and (abs(h) >= COHENS_H_MIN)
+    significant = (p < BONFERRONI_ALPHA) and (abs(h) >= COHENS_H_MIN)
     return {"delta": raw_delta if significant else 0.0, "raw_delta": raw_delta,
             "significant": significant, "p": p, "effect_h": h,
             "asr_prev": p_prev, "asr_curr": p_curr, "n": len(pa)}
 
 
 def gated_delta_dl(rows_prev, rows_curr, technique=None):
-    """DeltaDL, gated: Wilcoxon p<0.05/7 AND |rank-biserial r|>=0.20."""
+    """DeltaDL, gated: Wilcoxon p<0.05/7 (Bonferroni-corrected over the 7
+    attack classes, Section 6) AND |rank-biserial r|>=0.20."""
     dl_prev = dl_median(rows_prev, technique)
     dl_curr = dl_median(rows_curr, technique)
     if dl_prev is None or dl_curr is None:
@@ -272,7 +274,7 @@ def gated_delta_dl(rows_prev, rows_curr, technique=None):
     p = wilcoxon_p(x, y)
     r_eff = rank_biserial_matched(x, y)
     raw_delta = dl_prev - dl_curr
-    significant = (p < ALPHA) and (abs(r_eff) >= COHENS_H_MIN)
+    significant = (p < BONFERRONI_ALPHA) and (abs(r_eff) >= COHENS_H_MIN)
     return {"delta": raw_delta if significant else 0.0, "raw_delta": raw_delta,
             "significant": significant, "p": p, "effect_r": r_eff,
             "dl_prev": dl_prev, "dl_curr": dl_curr, "n": len(pa)}

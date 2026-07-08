@@ -1,0 +1,20 @@
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequireDigestPin
+metadata:
+  name: require-digest-pin
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    # Scoped to tenant namespaces only — system pool (kube-system, falco,
+    # gatekeeper-system, istio-system, vault) is excluded so this control
+    # does not interfere with cluster infrastructure itself. Matches the L4
+    # scope note: system pool is shared/unisolated, not part of the
+    # per-tenant measurement surface this study exercises.
+    namespaces:
+      - "tenant-lowpriv"
+      - "tenant-finserv"
+      - "tenant-partner"
+      - "tenant-saas"
+  enforcementAction: deny

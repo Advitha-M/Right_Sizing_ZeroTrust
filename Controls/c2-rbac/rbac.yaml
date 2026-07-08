@@ -1,0 +1,33 @@
+# =============================================================================
+# C2 — RBAC (least privilege per tenant)
+# Each tenant's default SA gets ONLY namespaced read on its own pods/services.
+# The permissive C0 binding (tenant-lowpriv = cluster-admin) is removed by apply.sh.
+# Closes: A2-t2 (rolebinding->admin is still creatable by cluster-admin only),
+#         A3-t1 (cross-ns secret enum), A4 (unauthorized verbs), A1-t3 (API IDOR).
+# =============================================================================
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tenant-self-read
+  namespace: tenant-lowpriv
+  labels: { zt-control: c2-rbac }
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tenant-self-read-bind
+  namespace: tenant-lowpriv
+  labels: { zt-control: c2-rbac }
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: tenant-lowpriv
+roleRef:
+  kind: Role
+  name: tenant-self-read
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,40 @@
+# =============================================================================
+# C3 — OPA Gatekeeper ConstraintTemplate : allowed image registries
+# Defends: A5-t1 (disallowed registry docker.io), A5-t2 (unpinned/untrusted image)
+# A pod is admitted only if every image starts with an allowed-registry prefix.
+# =============================================================================
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sallowedregistries
+  labels: { zt-control: c3-opa }
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sAllowedRegistries
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            registries:
+              type: array
+              items: { type: string }
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sallowedregistries
+
+        violation[{"msg": msg}] {
+          c := input_containers[_]
+          not allowed_registry(c.image)
+          msg := sprintf("image from disallowed registry: %v", [c.image])
+        }
+
+        allowed_registry(image) {
+          reg := input.parameters.registries[_]
+          startswith(image, reg)
+        }
+
+        input_containers[c] { c := input.review.object.spec.containers[_] }
+        input_containers[c] { c := input.review.object.spec.initContainers[_] }

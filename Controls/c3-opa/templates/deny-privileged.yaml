@@ -1,0 +1,33 @@
+# =============================================================================
+# C3 — OPA Gatekeeper ConstraintTemplate : deny privileged containers + hostPath
+# Defends: A2-t1 (privileged+hostPath pod), A5-t3 (privileged init container)
+# =============================================================================
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sdenyprivileged
+  labels: { zt-control: c3-opa }
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sDenyPrivileged
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sdenyprivileged
+
+        violation[{"msg": msg}] {
+          c := input_containers[_]
+          c.securityContext.privileged == true
+          msg := sprintf("privileged container not allowed: %v", [c.name])
+        }
+
+        violation[{"msg": msg}] {
+          v := input.review.object.spec.volumes[_]
+          v.hostPath
+          msg := sprintf("hostPath volume not allowed: %v", [v.name])
+        }
+
+        input_containers[c] { c := input.review.object.spec.containers[_] }
+        input_containers[c] { c := input.review.object.spec.initContainers[_] }

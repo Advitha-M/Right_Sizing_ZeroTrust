@@ -1,0 +1,56 @@
+# =============================================================================
+# C3 — OPA Gatekeeper Constraints (instantiate the templates)
+# Scoped to the four tenant namespaces. enforcementAction: deny.
+# =============================================================================
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sDenyPrivileged
+metadata:
+  name: no-privileged-pods
+  labels: { zt-control: c3-opa }
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    namespaces: ["tenant-lowpriv", "tenant-finserv", "tenant-partner", "tenant-saas"]
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sDenyHostNamespaces
+metadata:
+  name: no-host-namespaces
+  labels: { zt-control: c3-opa }
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    namespaces: ["tenant-lowpriv", "tenant-finserv", "tenant-partner", "tenant-saas"]
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sAllowedRegistries
+metadata:
+  name: allowed-registries
+  labels: { zt-control: c3-opa }
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    namespaces: ["tenant-lowpriv", "tenant-finserv", "tenant-partner", "tenant-saas"]
+  parameters:
+    registries:
+      # legitimate workload images used by the testbed
+      - "docker.io/istio/"
+      - "istio/"
+      - "gcr.io/istio-release/"
+      - "registry.istio.io/"
+      - "docker.io/nicolaka/netshoot"
+      - "nicolaka/netshoot"
+      - "fortio/"
+      - "docker.io/fortio/"
+      # NOTE: bare docker.io/library/ubuntu and alpine:* are intentionally absent
+      # so A5-t1 (ubuntu) and A2-t1/A5-t3 (alpine privileged) are denied at admission.

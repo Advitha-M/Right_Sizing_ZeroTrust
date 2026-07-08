@@ -1,0 +1,32 @@
+# =============================================================================
+# C3 — OPA Gatekeeper ConstraintTemplate : deny host namespace sharing
+# Defends: A2 (node/host escape surface) — blocks hostNetwork/hostPID/hostIPC,
+# which are the other common privilege-escalation primitives beyond privileged.
+# =============================================================================
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sdenyhostnamespaces
+  labels: { zt-control: c3-opa }
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sDenyHostNamespaces
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sdenyhostnamespaces
+
+        violation[{"msg": msg}] {
+          input.review.object.spec.hostNetwork == true
+          msg := "hostNetwork not allowed"
+        }
+        violation[{"msg": msg}] {
+          input.review.object.spec.hostPID == true
+          msg := "hostPID not allowed"
+        }
+        violation[{"msg": msg}] {
+          input.review.object.spec.hostIPC == true
+          msg := "hostIPC not allowed"
+        }

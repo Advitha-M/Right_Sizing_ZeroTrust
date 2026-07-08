@@ -1,0 +1,82 @@
+# =============================================================================
+# C6 — Istio : STRICT mTLS + per-tenant AuthorizationPolicy (L7 identity)
+#   - mesh-wide STRICT PeerAuthentication: only mTLS workload identities talk
+#   - tenant-finserv: deny ALL cross-tenant principals (isolated victim)
+#   - tenant-partner: ALLOW tenant-saas, DENY tenant-lowpriv at L7 (the "network-allowed, service-denied"
+#     partner — this is the headline service-mesh demonstration)
+#   - tenant-saas: ALLOW tenant-lowpriv (fully-allowed partner)
+# Closes: A1-t2 (L7 service call to tenant-finserv/tenant-partner), A3-t2 (plaintext/mTLS spoof),
+#         A3-t3 (identity authz bypass tenant-lowpriv->tenant-partner)
+# Requires: namespaces labelled istio-injection=enabled and workloads restarted
+#           so sidecars are present (handled by apply.sh).
+# =============================================================================
+---
+# ---- mesh-wide STRICT mTLS ---------------------------------------------------
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default-strict-mtls
+  namespace: istio-system
+  labels: { zt-control: c6-istio }
+spec:
+  mtls: { mode: STRICT }
+---
+# ---- tenant-finserv: deny everything not from tenant-finserv itself --------------------------
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: tenant-finserv-deny-cross-tenant
+  namespace: tenant-finserv
+  labels: { zt-control: c6-istio }
+spec:
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/tenant-finserv/sa/*"]
+---
+# ---- tenant-partner: allow tenant-saas + tenant-partner, implicitly deny tenant-lowpriv -----------------
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: tenant-partner-allow-partners
+  namespace: tenant-partner
+  labels: { zt-control: c6-istio }
+spec:
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/tenant-partner/sa/*"
+              - "cluster.local/ns/tenant-saas/sa/*"
+---
+# ---- tenant-partner: explicit DENY for tenant-lowpriv principal (defense in depth) ------------
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: tenant-partner-deny-tenant-lowpriv
+  namespace: tenant-partner
+  labels: { zt-control: c6-istio }
+spec:
+  action: DENY
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/tenant-lowpriv/sa/*"]
+---
+# ---- tenant-saas: allow tenant-lowpriv (fully-allowed partner flow) -----------------------
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: tenant-saas-allow-tenant-lowpriv
+  namespace: tenant-saas
+  labels: { zt-control: c6-istio }
+spec:
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/tenant-saas/sa/*"
+              - "cluster.local/ns/tenant-lowpriv/sa/*"

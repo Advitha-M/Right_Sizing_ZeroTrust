@@ -1,0 +1,124 @@
+# =============================================================================
+# C5 — NetworkPolicy (Cilium) : default-deny + intra-tenant allow
+#   - every tenant: default-deny ingress
+#   - intra-namespace traffic allowed (apps still work within a tenant)
+#   - DNS egress to kube-dns allowed for everyone (else nothing resolves)
+#   - tenant-lowpriv egress to other TENANT namespaces is DENIED (cross-tenant breakout)
+#   - tenant-saas is the "allowed partner": it explicitly permits ingress from tenant-lowpriv
+#     (so A1/A7 against tenant-saas still succeed at the network layer by design —
+#      tenant-saas's openness is what later L3/L7 controls scope down)
+# Closes (vs tenant-finserv/tenant-partner): A1-t1 (raw network reach), A6-t2 (egress exfil),
+#                             A7-t1 (network pivot)
+# NOTE: applied as standard NetworkPolicy objects which Cilium enforces.
+# =============================================================================
+---
+# ---- default-deny ingress for each tenant -----------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny-ingress, namespace: tenant-lowpriv, labels: { zt-control: c5-networkpolicy } }
+spec: { podSelector: {}, policyTypes: ["Ingress"] }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny-ingress, namespace: tenant-finserv, labels: { zt-control: c5-networkpolicy } }
+spec: { podSelector: {}, policyTypes: ["Ingress"] }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny-ingress, namespace: tenant-partner, labels: { zt-control: c5-networkpolicy } }
+spec: { podSelector: {}, policyTypes: ["Ingress"] }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny-ingress, namespace: tenant-saas, labels: { zt-control: c5-networkpolicy } }
+spec: { podSelector: {}, policyTypes: ["Ingress"] }
+---
+# ---- intra-tenant allow (same namespace can talk to itself) ------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-intra-namespace, namespace: tenant-lowpriv, labels: { zt-control: c5-networkpolicy } }
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+  ingress: [ { from: [ { podSelector: {} } ] } ]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-intra-namespace, namespace: tenant-finserv, labels: { zt-control: c5-networkpolicy } }
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+  ingress: [ { from: [ { podSelector: {} } ] } ]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-intra-namespace, namespace: tenant-partner, labels: { zt-control: c5-networkpolicy } }
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+  ingress: [ { from: [ { podSelector: {} } ] } ]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-intra-namespace, namespace: tenant-saas, labels: { zt-control: c5-networkpolicy } }
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+  ingress: [ { from: [ { podSelector: {} } ] } ]
+---
+# ---- tenant-saas is the allowed partner: explicitly permit ingress from tenant-lowpriv ----
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-from-tenant-lowpriv, namespace: tenant-saas, labels: { zt-control: c5-networkpolicy } }
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { tenant: tenant-lowpriv } }
+---
+# ---- tenant-partner (L7-restricted partner) permits network ingress from tenant-lowpriv -------
+#      (network-allowed; the L7 *service* denial is enforced later by Istio at C3)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-from-tenant-lowpriv, namespace: tenant-partner, labels: { zt-control: c5-networkpolicy } }
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { tenant: tenant-lowpriv } }
+---
+# ---- DNS egress allow for every tenant (kube-dns in kube-system) -------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-dns-egress, namespace: tenant-lowpriv, labels: { zt-control: c5-networkpolicy } }
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector: { matchLabels: { k8s-app: kube-dns } }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # tenant-lowpriv may reach the apiserver and tenant-saas (allowed partner) but NOT tenant-finserv/tenant-partner
+    - to:
+        - namespaceSelector: { matchLabels: { tenant: tenant-saas } }
+---
+# ---- istiod egress allow for tenant-lowpriv (sidecar injection + xDS discovery) -------
+# Without this, tenant-lowpriv pods get stuck at Init:1/2 when C2+C3 are both active
+# because the injection webhook (15012) and discovery (15017) are blocked.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-istiod-egress, namespace: tenant-lowpriv, labels: { zt-control: c5-networkpolicy } }
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: istio-system } }
+      ports:
+        - { protocol: TCP, port: 15012 }
+        - { protocol: TCP, port: 15017 }

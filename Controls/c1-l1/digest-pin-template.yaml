@@ -1,0 +1,25 @@
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredigestpin
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequireDigestPin
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredigestpin
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not contains(container.image, "@sha256:")
+          msg := sprintf("image '%v' is not digest-pinned (L1 image-pull verification requires @sha256: reference)", [container.image])
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.initContainers[_]
+          not contains(container.image, "@sha256:")
+          msg := sprintf("initContainer image '%v' is not digest-pinned (L1 image-pull verification requires @sha256: reference)", [container.image])
+        }

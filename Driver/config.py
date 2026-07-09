@@ -32,10 +32,13 @@ CLEANUP_DIR = REPO_ROOT / "cleanup"
 # ── Per-layer control wiring ──────────────────────────────────────────────
 # (layer_id, human label, control directory name) — order matches the
 # canonical build order L1->L7 from constants.CANONICAL_ORDER (minus the
-# base layer L2, which is never applied/removed via a script — see
-# infra/audit/audit-policy.yaml). set_config() in driver.py applies in this
-# order and removes in reverse, so ordering here IS the apply/remove order,
-# not just documentation.
+# base layer L2, which is never applied/removed via a script on the main
+# KIND cluster — see infra/audit/audit-policy.yaml). set_config() in
+# driver.py applies in this order and removes in reverse, so ordering here
+# IS the apply/remove order, not just documentation.
+# EXCEPTION: K3S_LAYERS below (LAYERS + an L2 entry) is used by the k3s-only
+# (L2,L3a) separation sampler, where L2 IS live-toggled — see
+# Controls/c-l2-audit/apply.sh.
 LAYERS = [
     ("L1",  "Cloud & infra (etcd encryption + digest-pin)", "c1-l1"),
     ("L3a", "RBAC",                                          "c2-rbac"),
@@ -55,6 +58,35 @@ def apply_script(layer_id: str) -> Path:
 
 def remove_script(layer_id: str) -> Path:
     return CONTROLS_DIR / _DIR_FOR_LAYER[layer_id] / "remove.sh"
+
+
+# ── k3s (L2,L3a) separation sampler wiring ────────────────────────────────
+# Scoped entirely to Driver.driver.run_l2_l3a_sep() / samplers_l2l3a_k3s.py.
+# Everywhere else in this file/driver.py, LAYERS and set_config() target the
+# main KIND cluster's default kubeconfig context and never touch L2. See
+# Controls/c-l2-audit/apply.sh's header for why L2 can only be genuinely
+# toggled on k3s.
+K3S_DIR        = REPO_ROOT / "Infra" / "k3s"
+K3S_BOOTSTRAP  = K3S_DIR / "bootstrap.sh"
+K3S_TEARDOWN   = K3S_DIR / "teardown.sh"
+# Populated by bootstrap.sh (copies /etc/rancher/k3s/k3s.yaml here with the
+# server URL left as-is — single-node install, no rewrite needed).
+K3S_KUBECONFIG = K3S_DIR / "k3s.yaml"
+
+# L2 + the existing 7 LAYERS, in canonical build order — used ONLY by
+# set_config_k3s(). The main set_config() keeps using LAYERS (no L2 entry)
+# unchanged for every other mode.
+K3S_LAYERS = [("L2", "Cluster access control (audit logging)", "c-l2-audit")] + LAYERS
+
+_K3S_DIR_FOR_LAYER = {lid: d for lid, _name, d in K3S_LAYERS}
+
+
+def apply_script_k3s(layer_id: str) -> Path:
+    return CONTROLS_DIR / _K3S_DIR_FOR_LAYER[layer_id] / "apply.sh"
+
+
+def remove_script_k3s(layer_id: str) -> Path:
+    return CONTROLS_DIR / _K3S_DIR_FOR_LAYER[layer_id] / "remove.sh"
 
 
 # ── Timing / seed defaults ────────────────────────────────────────────────

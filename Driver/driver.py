@@ -20,9 +20,11 @@ Changes from previous version:
   - --mode {sequential, mc-pairs}: mc-pairs wires shapley_pair_sampler
   - joint-config mode REMOVED (joint_config_constructor dropped from
     samplers.py; author-confirmed, not needed for this study)
-  - l2-l3a-sep mode DISABLED (l2_l3a_separation_sampler deferred to a
-    k3s-based implementation; driver wiring kept commented out, ready
-    to restore once that sampler module is supplied)
+  - l2-l3a-sep mode IMPLEMENTED against k3s: samplers_l2l3a_k3s.py's
+    l2_l3a_separation_sampler() treats L2 as genuinely toggleable (unlike
+    everywhere else in this repo, where L2 = BASE_LAYER, fixed), via the
+    new Controls/c-l2-audit control and set_config_k3s()/C.K3S_KUBECONFIG.
+    Requires Infra/k3s/bootstrap.sh to have been run first.
   - mc-pairs and dl-robust now run BOTH precursor and with-pair points
     per draw (mc-pairs: 4 points — precursor/with x La/Lb; dl-robust:
     2 points — precursor/with for the joint pair), each as its own
@@ -295,6 +297,43 @@ def wait_stable(seconds=25):
     time.sleep(seconds)
 
 
+def set_config_k3s(target_layers, applied):
+    """
+    k3s counterpart to set_config(), used ONLY by run_l2_l3a_sep(). Two
+    differences from set_config():
+      1. Iterates C.K3S_LAYERS (includes L2 -> Controls/c-l2-audit) instead
+         of C.LAYERS, so L2 actually gets applied/removed like any other
+         layer instead of being assumed permanently active.
+      2. Every subprocess targets the k3s cluster via KUBECONFIG=
+         C.K3S_KUBECONFIG, never the main KIND cluster's default context —
+         these two clusters are entirely separate and must not cross-talk.
+    Applies/removes in C.K3S_LAYERS' fixed canonical order regardless of
+    the sample's actual layer_order — same convention as set_config(): a
+    layer's physical install order doesn't affect its functional end-state,
+    only *which set* of layers is active does. The sampled layer_order is
+    what varied the logical stack position for the study's purposes; it
+    is not replayed as an install sequence.
+    """
+    k3s_env = {"KUBECONFIG": str(C.K3S_KUBECONFIG)}
+    target = set(target_layers)
+    for lid in reversed([l for l, _n, _d in C.K3S_LAYERS]):
+        if lid in applied and lid not in target:
+            log(f"  [k3s] removing {lid}")
+            rc, out, _ = run(f"bash {C.remove_script_k3s(lid)}", timeout=360, env=k3s_env)
+            if rc != 0:
+                log(f"  [k3s] WARN remove {lid} rc={rc}")
+            applied.discard(lid)
+    for lid, _name, _d in C.K3S_LAYERS:
+        if lid in target and lid not in applied:
+            log(f"  [k3s] applying {lid}")
+            timeout = 480 if lid == "L6" else 360
+            rc, out, _ = run(f"bash {C.apply_script_k3s(lid)}", timeout=timeout, env=k3s_env)
+            if rc != 0:
+                log(f"  [k3s] WARN apply {lid} rc={rc}:\n{out[-400:]}")
+            applied.add(lid)
+    return applied
+
+
 def reset_state():
     script = C.CLEANUP_DIR / "reset_trial.sh"
     if script.exists():
@@ -505,27 +544,71 @@ def run_dl_robust(con, args, run_id):
     return applied
 
 
-# ── L2/L3a separation mode (axis 3) ───────────────────────────────────────────
-# COMMENTED OUT — l2_l3a_separation_sampler does not exist in the current
-# samplers.py (deferred to a k3s-based implementation). This wiring is kept
-# here, inert, for when that sampler module is supplied.
-#
-# def run_l2_l3a_sep(con, args, run_id):
-#     from samplers import l2_l3a_separation_sampler
-#     mc_seed = args.mc_seed if args.mc_seed is not None else (
-#         int(hashlib.md5(run_id.encode()).hexdigest()[:8], 16)
-#     )
-#     samples = l2_l3a_separation_sampler(seed=mc_seed)
-#     log(f"  L2-L3a separation: {len(samples)} SampledConditions (seed={mc_seed})")
-#
-#     applied = set()
-#     for sample in samples:
-#         log(f"\n### L2L3A-SEP {sample.sample_id} — layers {sample.active_layers} ###")
-#         applied = set_config(sample.active_layers, applied)
-#         wait_stable()
-#         run_trials(con, run_id, sample.sample_id, sample.active_layers,
-#                    args.attacks, args.trials, args)
-#     return applied
+# ── L2/L3a separation mode (axis 3, k3s-only) ─────────────────────────────────
+
+def run_l2_l3a_sep(con, args, run_id):
+    """
+    Runs all 4 measurement points per l2_l3a_separation_sampler draw:
+    precursor_a/with_a (L2) and precursor_b/with_b (L3a) — needed to
+    compute L2's and L3a's marginal DL contributions independently
+    (DL_solo_best, brief Section 10.2). Structurally identical to
+    run_mc_pairs(), with two differences required because this is the one
+    axis that runs against k3s instead of the main KIND cluster:
+      1. set_config_k3s() instead of set_config() — knows how to toggle L2
+         via Controls/c-l2-audit and targets C.K3S_LAYERS.
+      2. KUBECONFIG is switched to C.K3S_KUBECONFIG for the duration of
+         this function (restored in `finally`), so run_trials()'s attack
+         scripts, invariant checks, and measure_dl()'s Falco polling all
+         transparently hit the k3s cluster too — those functions are
+         shared with every other mode and have no kubeconfig parameter of
+         their own, so this is done via the process environment rather
+         than threading a new argument through the whole call chain.
+    Assumes Infra/k3s/bootstrap.sh has already been run at least once
+    (idempotent, not called automatically here — see that script's header).
+    Does NOT tear the k3s cluster down afterward, same convention as every
+    other mode leaving the KIND cluster running post-run.
+    """
+    from samplers_l2l3a_k3s import l2_l3a_separation_sampler
+
+    if not C.K3S_KUBECONFIG.exists():
+        log(f"  [FATAL] {C.K3S_KUBECONFIG} not found. Run "
+            f"{C.K3S_BOOTSTRAP} first (see its header) before --mode l2-l3a-sep.")
+        return set()
+
+    mc_seed = args.mc_seed if args.mc_seed is not None else (
+        int(hashlib.md5(run_id.encode()).hexdigest()[:8], 16)
+    )
+    samples = l2_l3a_separation_sampler(seed=mc_seed)
+    log(f"  L2-L3a separation (k3s): {len(samples)} SampledConditions x 4 points each "
+        f"(seed={mc_seed})")
+
+    prev_kubeconfig = os.environ.get("KUBECONFIG")
+    os.environ["KUBECONFIG"] = str(C.K3S_KUBECONFIG)
+    log(f"  [k3s] KUBECONFIG switched to {C.K3S_KUBECONFIG} for this mode")
+
+    applied = set()
+    try:
+        for sample in samples:
+            points = [
+                (f"{sample.sample_id}_pre_L2",   sample.precursor_a),
+                (f"{sample.sample_id}_with_L2",  sample.with_a),
+                (f"{sample.sample_id}_pre_L3a",  sample.precursor_b),
+                (f"{sample.sample_id}_with_L3a", sample.with_b),
+            ]
+            for config_label, layers in points:
+                log(f"\n### L2L3A-SEP {config_label} — layers {layers} ###")
+                applied = set_config_k3s(layers, applied)
+                wait_stable()
+                run_trials(con, run_id, config_label, layers,
+                           args.attacks, args.trials, args)
+    finally:
+        if prev_kubeconfig is not None:
+            os.environ["KUBECONFIG"] = prev_kubeconfig
+        else:
+            os.environ.pop("KUBECONFIG", None)
+        log("  [k3s] KUBECONFIG restored to prior value "
+            f"({prev_kubeconfig or '<unset, ambient default>'})")
+    return applied
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -551,9 +634,10 @@ def main():
                          "runs all 4 precursor/with points per draw. dl-robust: "
                          "dl_robustness_sampler over DL_CANDIDATE_PAIRS (axis 4, "
                          "no superadditivity gate), runs precursor+with per draw. "
-                         "l2-l3a-sep: DISABLED — l2_l3a_separation_sampler is not "
-                         "in the current samplers.py (deferred to k3s); selecting "
-                         "this mode will error until that sampler is supplied.")
+                         "l2-l3a-sep: k3s ONLY (Infra/k3s/bootstrap.sh must have "
+                         "been run already) — l2_l3a_separation_sampler, both L2 "
+                         "and L3a independently toggled, runs all 4 precursor/with "
+                         "points per draw. Requires K3S_KUBECONFIG to exist.")
     ap.add_argument("--dry-run",    action="store_true")
     ap.add_argument("--run-id",     default=None,
                     help="Named run ID. Auto-generated if not supplied.")
@@ -616,11 +700,26 @@ def main():
                     log(f"  {s.sample_id}: with={s.active_layers}")
             log(f"DL-robust dry run total across all DL_CANDIDATE_PAIRS: {total}")
         elif args.mode == "l2-l3a-sep":
-            log("  [DISABLED] l2-l3a-sep: l2_l3a_separation_sampler is not "
-                "present in the current samplers.py (deferred to a k3s-based "
-                "implementation). The driver wiring for this mode is kept, "
-                "commented out, in run_l2_l3a_sep() for when that sampler "
-                "is supplied.")
+            from samplers_l2l3a_k3s import l2_l3a_separation_sampler
+            mc_seed = args.mc_seed if args.mc_seed is not None else (
+                int(hashlib.md5(run_id.encode()).hexdigest()[:8], 16)
+            )
+            samples = l2_l3a_separation_sampler(seed=mc_seed)
+            n_points = len(samples) * 4
+            log(f"L2-L3a-sep dry run (k3s): {len(samples)} draws x 4 points x "
+                f"{len(args.attacks)} attacks x {args.trials} trials = "
+                f"{n_points*len(args.attacks)*args.trials}")
+            for sam in samples[:2]:
+                log(f"  {sam.sample_id}: pre_L2={sam.precursor_a}")
+                log(f"  {sam.sample_id}: with_L2={sam.with_a}")
+                log(f"  {sam.sample_id}: pre_L3a={sam.precursor_b}")
+                log(f"  {sam.sample_id}: with_L3a={sam.with_b}")
+            if len(samples) > 2:
+                log(f"  ... ({len(samples)-2} more draws, 4 points each)")
+            if not C.K3S_KUBECONFIG.exists():
+                log(f"  [NOTE] {C.K3S_KUBECONFIG} does not exist yet — "
+                    f"run {C.K3S_BOOTSTRAP} before a real (non-dry-run) "
+                    f"l2-l3a-sep run.")
             return
         return
 
@@ -632,12 +731,7 @@ def main():
     elif args.mode == "dl-robust":
         run_dl_robust(con, args, run_id)
     else:  # l2-l3a-sep
-        log("  [DISABLED] l2-l3a-sep: l2_l3a_separation_sampler is not "
-            "present in the current samplers.py (deferred to a k3s-based "
-            "implementation). See the commented-out run_l2_l3a_sep() for "
-            "the wiring to restore once that sampler is supplied.")
-        con.close()
-        return
+        run_l2_l3a_sep(con, args, run_id)
     con.close()
     log(f"\nAugmentation complete. Results in {C.RESULTS_DB}")
     log(f"Run ID: {run_id}  N={args.trials}  M={args.mc_permutations}  mode={args.mode}")

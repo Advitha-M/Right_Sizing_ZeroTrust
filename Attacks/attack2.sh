@@ -30,9 +30,15 @@
 #     concern per Section 12, not something this script should paper over).
 #   T3 forges an X.509 cert carrying a SPIFFE ID in the SAN URI field (the
 #     actual SVID encoding, not just a CN string) and presents it to the
-#     mesh — a faithful SPIFFE SVID forgery regardless of whether a real
-#     SPIRE server is present, since the point is testing whether Istio
-#     rejects an SVID-shaped cert from an untrusted root.
+#     mesh — a faithful SPIFFE SVID forgery. REVISION 6 UPDATE: a real SPIRE
+#     server is now deployed (Controls/c7-vault Part 2, Driver/constants.py's
+#     L7_SCOPE_NOTE) with its own trust bundle/CA, so "untrusted root" is now
+#     literal — this forged cert is signed by a throwaway local CA, not
+#     SPIRE's, and the question this technique tests is unchanged: whether
+#     Istio's mesh (L6) rejects an SVID-shaped cert that isn't chained to
+#     that trust bundle. (T3's primary defender stays L6, not L7 — SPIRE
+#     issuing the mesh's real identities is what makes L6's rejection
+#     meaningful here, but the enforcement point is still Istio's mTLS.)
 #
 # Output: SUCCESS|<technique>|<detail>
 #         BLOCKED|<technique>|<detail>

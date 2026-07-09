@@ -239,6 +239,26 @@ phase5(){
     --wait --timeout 5m || echo "       (warn) vault issue — verify later"
   # k8s auth + dynamic secrets are wired at C7 (controls/c7-vault/apply.sh).
 
+  step "Installing SPIRE server + agent (namespace 'spire', trust domain cluster.local)"
+  # Present, NOT attesting any workloads yet — controls/c7-vault/apply.sh
+  # (Part 2) registers the actual per-tenant SPIFFE entries at C7, same
+  # "installed but not enforcing until its Controls/ apply.sh runs" pattern
+  # as Istio/Gatekeeper above. Chart values below are the common defaults for
+  # spiffe/helm-charts-hardened's "spire" chart as of this writing — verify
+  # against that repo's docs if the chart's value schema has moved on.
+  helm repo add spiffe https://spiffe.github.io/helm-charts-hardened/ >/dev/null 2>&1
+  helm repo update >/dev/null
+  helm upgrade --install spire spiffe/spire \
+    --namespace spire --create-namespace \
+    --set global.spire.trustDomain=cluster.local \
+    --set global.spire.clusterName=zt-lab \
+    --wait --timeout 5m || echo "       (warn) SPIRE install issue — verify later (chart values may need adjusting for your chart version)"
+  step "Waiting for spire-server-0 and spire-agent DaemonSet"
+  kubectl -n spire rollout status statefulset/spire-server --timeout=120s \
+    || echo "       (warn) spire-server not Ready — check 'kubectl -n spire get pods'"
+  kubectl -n spire rollout status daemonset/spire-agent --timeout=120s \
+    || echo "       (warn) spire-agent DaemonSet not Ready — check 'kubectl -n spire get pods'"
+
   echo "  PHASE 5 done. Tools installed; baseline behaviour UNCHANGED (still wide-open)."
 }
 

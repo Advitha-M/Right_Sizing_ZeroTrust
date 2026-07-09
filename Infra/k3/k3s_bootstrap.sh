@@ -144,6 +144,15 @@ helm upgrade --install vault hashicorp/vault \
   --set "server.dev.enabled=true" --set "server.dev.devRootToken=root" \
   --wait --timeout 5m || echo "   (warn) vault issue — verify later"
 
+step "Installing SPIRE server + agent (present, not enforcing — needed if L7 lands in a draw)"
+helm repo add spiffe https://spiffe.github.io/helm-charts-hardened/ >/dev/null 2>&1
+helm repo update >/dev/null
+helm upgrade --install spire spiffe/spire \
+  --namespace spire --create-namespace \
+  --set global.spire.trustDomain=cluster.local \
+  --set global.spire.clusterName=zt-lab-k3s \
+  --wait --timeout 5m || echo "   (warn) SPIRE install issue — verify later"
+
 banner "bootstrap.sh done"
 echo "KUBECONFIG for this cluster: ${HERE}/k3s.yaml (= Driver/config.py's K3S_KUBECONFIG)"
 echo "L2 (audit logging) is OFF by default — Controls/c-l2-audit/apply.sh turns it on;"

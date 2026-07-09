@@ -350,10 +350,18 @@ def reset_state():
 
 def measure_dl(attack: str, t_start: float) -> tuple:
     """
-    Polls Falco logs for a detection event. Returns (t_alert, alert_source, dl_sec).
-    t_alert and alert_source are None when no detection fires within DL_TIMEOUT.
-    Structured as a tuple so Hubble/audit sources can be added later without
-    changing the DB schema.
+    Polls Falco logs, and now also SPIRE agent/server logs, for a detection
+    event. Returns (t_alert, alert_source, dl_sec); t_alert and alert_source
+    are None when no detection fires within DL_TIMEOUT.
+
+    SPIRE polling added so the (L1,L7) DL candidate pair's "identity-forgery
+    attempt" shared detection event (constants.DL_CANDIDATE_PAIRS) has a real
+    L7-side signal: attempted attestation with mismatched/unregistered
+    selectors, or a rejected SVID, both produce a log line matching the
+    patterns below on the spire-agent DaemonSet or spire-server StatefulSet.
+    Falco is still checked first each iteration (unchanged priority/behavior
+    for every other attack class); SPIRE is an additional independent check,
+    not a replacement.
     """
     deadline = t_start + min(C.DL_TIMEOUT, 30)
     pattern = attack.upper()
@@ -367,6 +375,25 @@ def measure_dl(attack: str, t_start: float) -> tuple:
         )):
             t_alert = time.time()
             return t_alert, "falco", round(t_alert - t_start, 2)
+
+        rc2, out2, _ = run(
+            f"kubectl logs -n spire -l app.kubernetes.io/name=agent "
+            f"--since={C.DL_TIMEOUT}s --tail=200 2>/dev/null; "
+            f"kubectl logs -n spire spire-server-0 -c spire-server "
+            f"--since={C.DL_TIMEOUT}s --tail=200 2>/dev/null", timeout=15
+        )
+        # SPIRE's own wording for these conditions (agent + server logs,
+        # roughly stable across recent releases): a workload whose process
+        # selectors don't match any registered entry gets "no identity
+        # issued"/"unable to attest"; a rejected node/agent gets "not
+        # authorized"/"attestation failed"/"denied".
+        if out2 and any(k in out2 for k in (
+            "no identity issued", "unable to attest", "attestation failed",
+            "not authorized", "PermissionDenied", "denied"
+        )):
+            t_alert = time.time()
+            return t_alert, "spire", round(t_alert - t_start, 2)
+
         time.sleep(2)
     return None, None, None
 

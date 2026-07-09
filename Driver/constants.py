@@ -33,8 +33,28 @@ LAYER_LABELS = {
     "L4":  "Tenant isolation",
     "L5":  "NetworkPolicy",
     "L6":  "Istio mTLS",
-    "L7":  "Vault dynamic secrets",
+    "L7":  "SPIRE workload identity + Vault dynamic secrets",
 }
+
+# L7 scope note: SPIRE server+agent are genuinely deployed (Controls/c7-vault
+# Part 2 registers real SPIFFE entries; Driver/driver.py's measure_dl() polls
+# real SPIRE agent/server logs as an "spire" alert_source) — this is NOT a
+# documented substrate limitation like L1_SCOPE_NOTE below. What remains a
+# real, honestly-flagged residual limitation: Vault's Kubernetes-auth backend
+# (Controls/c7-vault Part 1) still authenticates via the workload's raw SA
+# token, not via its SPIRE-issued X.509-SVID or a Vault cert-auth method
+# trusting the SPIRE CA — the two mechanisms run side by side rather than
+# being integrated into one credential path. attack7.sh's T2 fetches a real
+# SVID via the SPIRE Workload API to demonstrate genuine identity issuance,
+# but its Vault login step is still SA-token-based. Wiring Vault's cert-auth
+# method to the SPIRE trust bundle would close this gap; out of scope here.
+L7_SCOPE_NOTE = (
+    "L7 = SPIRE workload identity (genuinely deployed, real attestation, "
+    "real agent/server logs polled for DL) + Vault dynamic secrets (SA-token "
+    "Kubernetes auth, unchanged). The two mechanisms are not yet integrated "
+    "into a single credential path — Vault does not consume SPIRE SVIDs "
+    "directly. Documented scope limitation, not silently dropped."
+)
 
 # L1 scope note (v6): the full real-world L1 definition (VPC segmentation,
 # cloud IAM, OS hardening, image signing, etcd encryption) is RETAINED for

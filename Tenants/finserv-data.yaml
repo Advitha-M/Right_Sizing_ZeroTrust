@@ -1,0 +1,113 @@
+# =============================================================================
+# Tenants/finserv-data.yaml — tenant-finserv's PVC with mock PII and
+# transaction records (brief Section 13's tenant-finserv profile).
+#
+# Applied ONLY to tenant-finserv (Tenants/deploy.sh), unlike bookinfo.yaml
+# which is identical across all four tenants — this dataset is what makes
+# tenant-finserv's profile distinct from the other three, and what
+# Attacks/attack7.sh's t1-direct-egress actually exfiltrates (previously a
+# hardcoded "stolen=data" placeholder string, not any real dataset).
+#
+# Uses an explicit hostPath-backed PersistentVolume bound directly via
+# claimRef/volumeName, same convention Attacks/attack1.sh's t2-pvc-mismatch
+# already uses in this repo — not a dynamic StorageClass-provisioned PVC,
+# so this doesn't depend on KIND's default provisioner being present/working.
+#
+# All data below is SYNTHETIC: SSNs use the 900-xxx-xxxx prefix (never
+# issued as a real SSN range), names/addresses/emails are generated from a
+# small fixed word pool, account numbers and transaction amounts are
+# pseudo-random via awk. Nothing here is or resembles a real person's data.
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: finserv-mock-data-pv
+  labels: { zt-lab/tenant-data: "true" }
+spec:
+  capacity:
+    storage: 10Mi
+  accessModes: [ReadWriteOnce]
+  hostPath:
+    path: /tmp/zt-lab-finserv-mock-data
+  claimRef:
+    namespace: tenant-finserv
+    name: finserv-mock-data
+  persistentVolumeReclaimPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: finserv-mock-data
+  namespace: tenant-finserv
+  labels: { zt-lab/tenant-data: "true" }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Mi
+  volumeName: finserv-mock-data-pv
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: finserv-data-seed
+  namespace: tenant-finserv
+  labels: { zt-lab/tenant-data: "true" }
+spec:
+  backoffLimit: 2
+  template:
+    metadata: { labels: { app: finserv-data-seed } }
+    spec:
+      restartPolicy: Never
+      nodeSelector: { tenant: tenant-finserv }
+      containers:
+        - name: seed
+          image: alpine:3.20
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              echo "[seed] generating mock PII (customers.json)"
+              awk 'BEGIN {
+                srand();
+                split("Alex Jordan Taylor Morgan Casey Riley Avery Quinn Skyler Drew", first, " ");
+                split("Nguyen Smith Garcia Patel Kim Rossi Muller Dubois Silva Okafor", last, " ");
+                split("Elm Maple Cedar Birch Willow Aspen Pine Oak Spruce Alder", street, " ");
+                print "[";
+                n = 20;
+                for (i = 1; i <= n; i++) {
+                  fn = first[int(rand()*10)+1];
+                  ln = last[int(rand()*10)+1];
+                  ssn = sprintf("900-%02d-%04d", int(rand()*90)+10, int(rand()*9000)+1000);
+                  dob_y = 1950 + int(rand()*55);
+                  dob = sprintf("%04d-%02d-%02d", dob_y, int(rand()*12)+1, int(rand()*28)+1);
+                  addr = sprintf("%d %s St", int(rand()*9000)+100, street[int(rand()*10)+1]);
+                  email = sprintf("%s.%s%d@mocktest.invalid", tolower(fn), tolower(ln), int(rand()*99));
+                  printf "  {\"customer_id\": \"CUST%04d\", \"name\": \"%s %s\", \"ssn\": \"%s\", \"dob\": \"%s\", \"address\": \"%s\", \"email\": \"%s\"}", i, fn, ln, ssn, dob, addr, email;
+                  print (i < n ? "," : "");
+                }
+                print "]";
+              }' > /data/customers.json
+              echo "[seed] generating mock transaction records (transactions.csv)"
+              awk 'BEGIN {
+                srand();
+                split("Groceries Electronics Pharmacy Utilities Restaurant Travel Insurance Fuel Clothing Subscription", merchant, " ");
+                print "transaction_id,customer_id,account_number,amount_usd,date,merchant_category";
+                n = 200;
+                for (i = 1; i <= n; i++) {
+                  cust = int(rand()*20)+1;
+                  acct = sprintf("ACCT-%010d", int(rand()*9000000000)+1000000000);
+                  amt = sprintf("%.2f", rand()*2000);
+                  m = 2024;
+                  d = sprintf("%04d-%02d-%02d", m, int(rand()*12)+1, int(rand()*28)+1);
+                  cat = merchant[int(rand()*10)+1];
+                  printf "TXN%06d,CUST%04d,%s,%s,%s,%s\n", i, cust, acct, amt, d, cat;
+                }
+              }' > /data/transactions.csv
+              echo "[seed] done:"
+              wc -l /data/customers.json /data/transactions.csv
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: finserv-mock-data }

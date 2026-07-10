@@ -17,6 +17,21 @@
 #   T2 → L2  (cluster access control: expired OIDC token rejected by apiserver)
 #   T3 → L6  (Istio mTLS: forged/untrusted-CA SVID rejected by mesh)
 #
+# WIRING NOTE on T2 (added alongside the Dex/OIDC work — see Driver/
+# constants.py's L1_SCOPE_NOTE and Controls/c1-l1/apply.sh Part 3): T2's
+# primary defender is conceptually L2 (real-world OIDC-based apiserver
+# authentication genuinely is a cluster-access-control concern), but L2 has
+# no apply/remove script anywhere in this codebase — it's the fixed base
+# layer, present at every condition, by design. The actual TOGGLE that
+# determines whether the apiserver validates OIDC tokens at all lives in
+# L1's Part 3 (Dex deployment + apiserver --oidc-issuer-url wiring), because
+# that's where a togglable "install the mechanism, then wire it in" slot
+# already existed. So T2 SKIPs/runs based on L1's toggle state, not L2's
+# (L2 has no state to vary) — a documented substrate/wiring mismatch
+# between T2's conceptual defender and its measurable proxy, same honesty
+# standard as this file's other REVISION 6 notes, not a silent redefinition
+# of T2's real-world defender.
+#
 # REVISION 6 CORRECTION (this file): the prior version of T2 and T3 quietly
 # replaced the spec's actual techniques (OIDC token replay, SPIFFE SVID
 # forgery) with SA-TokenRequest-expiry and self-signed-cert-by-CN substitutes,
@@ -110,7 +125,7 @@ case "$TECHNIQUE" in
     #
     # If OIDC isn't configured/deployed, this SKIPs rather than substituting
     # a different auth mechanism — do not re-derive the technique.
-    [[ -z "${OIDC_ID_TOKEN:-}" ]] && skip "no-oidc-token-supplied-oidc-not-deployed"
+    [[ -z "${OIDC_ID_TOKEN:-}" ]] && skip "no-oidc-token-supplied-L1-part3-not-active-or-below-C1"
     [[ -z "${OIDC_TOKEN_EXP:-}" ]] && skip "no-oidc-token-exp-supplied"
 
     NOW=$(date +%s)

@@ -153,6 +153,70 @@ helm upgrade --install spire spiffe/spire \
   --set global.spire.clusterName=zt-lab-k3s \
   --wait --timeout 5m || echo "   (warn) SPIRE install issue — verify later"
 
+step "Installing Dex (present, not enforcing — needed if L1 lands in a draw)"
+kubectl create namespace dex --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+cat <<'DEXCFG' | kubectl apply -f - >/dev/null
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dex-config
+  namespace: dex
+data:
+  config.yaml: |
+    issuer: http://dex.dex.svc.cluster.local:5556/dex
+    storage: { type: memory }
+    web: { http: 0.0.0.0:5556 }
+    oauth2: { responseTypes: ["code", "token", "id_token"], skipApprovalScreen: true }
+    expiry: { idTokens: "30s" }
+    staticClients:
+      - id: zt-lab-kubectl
+        secret: zt-lab-kubectl-secret
+        name: zt-lab-kubectl
+        redirectURIs: ["http://localhost/callback"]
+        public: false
+    enablePasswordDB: true
+    staticPasswords:
+      - email: "attacker@zt-lab.local"
+        # Same verified hash as Infra/files(1)/setup.sh's phase5 (password: attacker-pw)
+        hash: "$2b$10$5SXv5Hj.yJYlXYxEYDo9GuEOIhxCCUBQ23cel2lbv2PZ7hIDVb1/G"
+        username: "attacker"
+        userID: "08a8684b-db88-4b73-90a9-3cd1661f5466"
+DEXCFG
+cat <<'DEXDEPLOY' | kubectl apply -f - >/dev/null
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: dex, namespace: dex }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: dex } }
+  template:
+    metadata: { labels: { app: dex } }
+    spec:
+      containers:
+        - name: dex
+          image: dexidp/dex:v2.41.1
+          args: ["dex", "serve", "/etc/dex/cfg/config.yaml"]
+          ports: [{ containerPort: 5556 }]
+          volumeMounts: [{ name: config, mountPath: /etc/dex/cfg }]
+      volumes:
+        - { name: config, configMap: { name: dex-config } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: dex, namespace: dex }
+spec:
+  selector: { app: dex }
+  ports: [{ port: 5556, targetPort: 5556 }]
+DEXDEPLOY
+kubectl -n dex rollout status deployment/dex --timeout=90s \
+  || echo "   (warn) dex not Ready — check 'kubectl -n dex get pods'"
+# NOTE: no vpc=vpc-regulated/vpc-general node labelling here, unlike
+# Infra/files(1)/setup.sh's phase5 — this is a single-node k3s cluster, so
+# node-level VPC-segmentation (Controls/c1-l1 Part 4) has nothing to
+# segment. If L1 lands in an l2-l3a-sep draw, its Part 4 step will find no
+# matching nodes and log a (warn), not fail — Part 3 (Dex/OIDC) is
+# unaffected and still applies normally on a single node.
+
 banner "bootstrap.sh done"
 echo "KUBECONFIG for this cluster: ${HERE}/k3s.yaml (= Driver/config.py's K3S_KUBECONFIG)"
 echo "L2 (audit logging) is OFF by default — Controls/c-l2-audit/apply.sh turns it on;"

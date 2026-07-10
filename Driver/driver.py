@@ -39,8 +39,11 @@ Usage:
     python3 driver/driver.py --mode mc-pairs --mc-permutations 2 --trials 5
 """
 import argparse
+import base64
 import hashlib
+import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -350,18 +353,19 @@ def reset_state():
 
 def measure_dl(attack: str, t_start: float) -> tuple:
     """
-    Polls Falco logs, and now also SPIRE agent/server logs, for a detection
-    event. Returns (t_alert, alert_source, dl_sec); t_alert and alert_source
-    are None when no detection fires within DL_TIMEOUT.
+    Polls Falco logs, SPIRE agent/server logs, Dex logs, and Cilium's
+    drop/policy-verdict monitor for a detection event. Returns
+    (t_alert, alert_source, dl_sec); t_alert and alert_source are None when
+    no detection fires within DL_TIMEOUT.
 
-    SPIRE polling added so the (L1,L7) DL candidate pair's "identity-forgery
-    attempt" shared detection event (constants.DL_CANDIDATE_PAIRS) has a real
-    L7-side signal: attempted attestation with mismatched/unregistered
-    selectors, or a rejected SVID, both produce a log line matching the
-    patterns below on the spire-agent DaemonSet or spire-server StatefulSet.
-    Falco is still checked first each iteration (unchanged priority/behavior
-    for every other attack class); SPIRE is an additional independent check,
-    not a replacement.
+    SPIRE polling gives the (L1,L7) DL candidate pair's "identity-forgery
+    attempt" shared detection event a real L7-side signal. Dex and Cilium
+    polling give L1 real detection sources for its two new proxies
+    (constants.py's L1_SCOPE_NOTE): Dex = cloud-IAM proxy, Cilium host-policy
+    monitor = VPC-segmentation proxy (Controls/c1-l1 Parts 3-4). Falco is
+    still checked first each iteration (unchanged priority/behavior for
+    every other attack class); the other three are additional independent
+    checks, not replacements.
     """
     deadline = t_start + min(C.DL_TIMEOUT, 30)
     pattern = attack.upper()
@@ -394,8 +398,111 @@ def measure_dl(attack: str, t_start: float) -> tuple:
             t_alert = time.time()
             return t_alert, "spire", round(t_alert - t_start, 2)
 
+        rc3, out3, _ = run(
+            f"kubectl logs -n dex -l app=dex --since={C.DL_TIMEOUT}s "
+            f"--tail=200 2>/dev/null", timeout=15
+        )
+        # Dex's own wording for a rejected/expired/malformed token attempt.
+        if out3 and any(k in out3 for k in (
+            "invalid_grant", "invalid_token", "expired", "unauthorized_client",
+            "failed to verify"
+        )):
+            t_alert = time.time()
+            return t_alert, "cloud-iam", round(t_alert - t_start, 2)
+
+        # cilium monitor is a live stream, not a log file — capture a short
+        # window from one cilium-agent pod each poll iteration. `timeout`
+        # bounds it so this can't hang the poll loop if the pod is slow to
+        # respond; 2s capture roughly matches the 2s sleep between
+        # iterations elsewhere in this loop, so coverage has no real gaps.
+        cilium_pod = _cilium_agent_pod_cache()
+        if cilium_pod:
+            rc4, out4, _ = run(
+                f"timeout 2 kubectl exec -n kube-system {cilium_pod} -c cilium-agent "
+                f"-- cilium monitor -t drop 2>/dev/null", timeout=6
+            )
+            if out4 and "c1-l1-vpc-segmentation" in out4:
+                t_alert = time.time()
+                return t_alert, "vpc-segmentation", round(t_alert - t_start, 2)
+
         time.sleep(2)
     return None, None, None
+
+
+_CILIUM_AGENT_POD = None
+
+def _cilium_agent_pod_cache():
+    """
+    Looks up one running cilium-agent pod once per driver.py process and
+    caches it (there's no need to re-resolve this every poll iteration —
+    cilium-agent pods are long-lived DaemonSet pods for the duration of a
+    run). Returns None (and measure_dl()'s Part-4 check is skipped for the
+    rest of this process) if Cilium isn't reachable, e.g. before Phase 1
+    has run — same graceful-degradation posture as the SPIRE/Dex checks
+    above, which return no match rather than raising.
+    """
+    global _CILIUM_AGENT_POD
+    if _CILIUM_AGENT_POD is None:
+        rc, out, _ = run(
+            "kubectl get pod -n kube-system -l k8s-app=cilium "
+            "--field-selector=status.phase=Running "
+            "-o jsonpath='{.items[0].metadata.name}' 2>/dev/null", timeout=10
+        )
+        _CILIUM_AGENT_POD = out.strip() if out and out.strip() else ""
+    return _CILIUM_AGENT_POD or None
+
+
+def fetch_dex_oidc_token(atk_ns: str):
+    """
+    Fetches a real Dex-issued OIDC ID token for A2's t2-oidc-token-replay,
+    via Dex's static passwordDB connector + resource-owner-password grant
+    (Controls/c1-l1 Part 3 / Infra phase5's Dex install). Runs the curl from
+    inside the attacker's own already-running pod (cheaper than spinning up
+    a temp pod per trial, and keeps the fetch happening from the attacker's
+    actual vantage point, consistent with this technique's insider-capture
+    framing).
+
+    Returns (id_token, exp_epoch_str) ready for OIDC_ID_TOKEN/OIDC_TOKEN_EXP
+    env vars, or (None, None) if Dex isn't reachable / apiserver OIDC isn't
+    configured — expected below C1 in the sequential build (see
+    constants.TECHNIQUE_MIN_CONDITION), or whenever L1 isn't in the active
+    set in other modes. attack2.sh's t2-oidc-token-replay SKIPs structurally
+    on (None, None), which is the correct, pre-existing behavior — this
+    function does not change that SKIP logic, only supplies real values
+    when they're available instead of requiring them to be pre-set manually.
+    """
+    atk_pod_rc, atk_pod, _ = run(
+        f"kubectl get pod -n {atk_ns} -l app=client "
+        f"--field-selector=status.phase=Running "
+        f"-o jsonpath='{{.items[0].metadata.name}}' 2>/dev/null", timeout=10
+    )
+    atk_pod = atk_pod.strip() if atk_pod else ""
+    if not atk_pod:
+        return None, None
+
+    rc, out, _ = run(
+        f"kubectl exec -n {atk_ns} {atk_pod} -- curl -s -m 8 -X POST "
+        f"http://dex.dex.svc.cluster.local:5556/dex/token "
+        f"-d grant_type=password -d 'scope=openid email' "
+        f"-d client_id=zt-lab-kubectl -d client_secret=zt-lab-kubectl-secret "
+        f"-d username=attacker@zt-lab.local -d password=attacker-pw",
+        timeout=15,
+    )
+    if rc != 0 or not out or "id_token" not in out:
+        return None, None
+
+    m = re.search(r'"id_token"\s*:\s*"([^"]+)"', out)
+    if not m:
+        return None, None
+    id_token = m.group(1)
+    try:
+        payload_b64 = id_token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        exp = str(int(payload["exp"]))
+    except Exception:
+        return None, None
+    return id_token, exp
 
 
 # ── Error type classification ─────────────────────────────────────────────────
@@ -456,10 +563,20 @@ def run_trials(con, run_id, config_label, active_layers,
             reset_state()
             t_start = time.time()
 
+            trial_env = {**env_base, "SEED": str(seed), "TECHNIQUE_IDX": str(tech_idx)}
+            if attack == "attack2":
+                # Real Dex-issued token when Part 3 (Controls/c1-l1) has run;
+                # (None, None) otherwise, which attack2.sh's existing
+                # missing-env-var SKIP already handles unchanged.
+                oidc_token, oidc_exp = fetch_dex_oidc_token(atk_ns)
+                if oidc_token is not None:
+                    trial_env["OIDC_ID_TOKEN"] = oidc_token
+                    trial_env["OIDC_TOKEN_EXP"] = oidc_exp
+
             rc, out, to = run(
                 f"bash {script}",
                 timeout=C.ATTACK_TIMEOUT,
-                env={**env_base, "SEED": str(seed), "TECHNIQUE_IDX": str(tech_idx)},
+                env=trial_env,
             )
             t_end   = time.time()
             verdict = classify(out, rc, to)

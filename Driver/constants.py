@@ -26,7 +26,8 @@ CANONICAL_ORDER    = [BASE_LAYER] + PERMUTABLE_LAYERS
 BASELINE_LAYERS    = [BASE_LAYER]
 
 LAYER_LABELS = {
-    "L1":  "Cloud & infra (image-pull verification + etcd encryption at rest)",
+    "L1":  "Cloud & infra (image-pull verification + etcd encryption + "
+           "Dex OIDC cloud-IAM proxy + Cilium host-policy VPC-segmentation proxy)",
     "L2":  "Cluster access control (audit logging) — base layer",
     "L3a": "RBAC",
     "L3b": "OPA/Kyverno admission",
@@ -56,20 +57,52 @@ L7_SCOPE_NOTE = (
     "directly. Documented scope limitation, not silently dropped."
 )
 
-# L1 scope note (v6): the full real-world L1 definition (VPC segmentation,
-# cloud IAM, OS hardening, image signing, etcd encryption) is RETAINED for
-# paper narrative even where it overlaps with other layers (e.g. image
-# verification also appears at L3b's admission stage — different enforcement
-# point: L1 = registry/pull-time, L3b = admission-time). VPC segmentation and
-# cloud IAM are NOT independently measurable on a local KIND substrate (no
-# cloud provider, single Docker host) — documented as a substrate limitation,
-# not a scope decision.
+# L1 scope note (v6, REVISED): the full real-world L1 definition (VPC
+# segmentation, cloud IAM, OS hardening, image signing, etcd encryption) is
+# RETAINED for paper narrative even where it overlaps with other layers
+# (e.g. image verification also appears at L3b's admission stage — different
+# enforcement point: L1 = registry/pull-time, L3b = admission-time).
+#
+# VPC segmentation and cloud IAM previously had NO implementable proxy under
+# KIND. Both now do, added as Controls/c1-l1 Parts 3-4:
+#   - Cloud IAM  -> Dex (local OIDC identity provider). Real cloud IAM
+#     systems reach Kubernetes via OIDC federation (AWS IRSA, GCP Workload
+#     Identity) — Dex is that same mechanism run locally, not a stretch
+#     analogy. Wires the apiserver's --oidc-issuer-url et al. (toggled by
+#     L1, docker-exec into the control-plane container, same technique
+#     Part 1 already uses for etcd encryption) and unblocks attack2.sh's
+#     A2-t2-oidc-token-replay, which previously SKIPped unconditionally
+#     (see kind-cluster.yaml's original header note: "no OIDC issuer"; see
+#     TECHNIQUE_MIN_CONDITION below for the new C1 floor this creates).
+#     Dex's own logs are a genuine detection source, polled by
+#     Driver.driver.measure_dl() as alert_source="cloud-iam".
+#   - VPC segmentation -> a CiliumClusterwideNetworkPolicy operating at the
+#     Cilium host-firewall level (node-to-node), gating on a "vpc" node
+#     label (vpc-regulated = tenant-finserv+tenant-partner nodes,
+#     vpc-general = tenant-lowpriv+tenant-saas nodes) — genuinely distinct
+#     from L5, which enforces pod/namespace NetworkPolicy, not node/host
+#     traffic. IMPORTANT SCOPE LIMIT: this restricts HOST-level traffic
+#     (kubelet-to-kubelet, node health/management — analogous to a cloud
+#     security-group boundary between subnets), NOT ordinary pod-to-pod
+#     application traffic between nodes, which stays governed by L5 alone.
+#     Cilium's own drop/policy-verdict monitor (`cilium monitor -t drop`,
+#     run inside a cilium-agent pod — no separate Hubble relay/UI install
+#     needed) is the detection source, polled as
+#     alert_source="vpc-segmentation".
+#
+# Neither is full-fidelity cloud infrastructure (there is still no real
+# cloud account, no real VPC/subnet routing, no real IAM role/policy
+# engine) — both are local proxies for the mechanism a real cloud
+# deployment would use, same honesty standard as the pre-existing
+# digest-pin/cosign and audit-logging proxies elsewhere in this file.
 L1_SCOPE_NOTE = (
-    "L1 measured proxy = image-pull verification + etcd encryption at rest. "
-    "VPC segmentation and cloud IAM are conceptually part of L1 but have no "
-    "implementable proxy under KIND (no cloud provider, single Docker host) "
-    "— substrate limitation, stated explicitly in methods/limitations, not "
-    "silently dropped from scope."
+    "L1 measured proxy = image-pull verification + etcd encryption at rest "
+    "+ Dex OIDC (cloud-IAM proxy) + Cilium host-policy node segmentation "
+    "(VPC-segmentation proxy). All four are genuinely implemented and "
+    "genuinely toggled by Controls/c1-l1; none is a full-fidelity clone of "
+    "real cloud infrastructure (no cloud account, no real VPC routing, no "
+    "real IAM policy engine) — documented proxies, not silently dropped "
+    "from scope, consistent with this file's other proxy layers."
 )
 
 # L4 scope note (v6): tenant pools (tenant-finserv/tenant-saas/tenant-lowpriv/
@@ -202,7 +235,19 @@ ATTACKER_NS_MAP = {
 # corrected 8-condition primary build). Token also corrected to match the
 # rewritten attack7.sh technique (SA-token Vault k8s-auth, not static token).
 TECHNIQUE_MIN_CONDITION = {
-    ("A7", "t2-vault-sa-token-exfil"): "C7",   # Vault pod/role not populated before C7
+    ("A7", "t2-vault-sa-token-exfil"):  "C7",  # Vault pod/role not populated before C7
+    ("A2", "t2-oidc-token-replay"):     "C1",  # apiserver --oidc-issuer-url only set
+                                                # once L1 is applied (Controls/c1-l1
+                                                # Part 3, new); L1 is C1 in the
+                                                # canonical sequential order (L2 base
+                                                # -> L1 -> L3a -> ...). Outside the
+                                                # sequential sweep (mc-pairs/dl-robust/
+                                                # l2-l3a-sep), the real gating condition
+                                                # is "L1 in active_layers", not a fixed
+                                                # Cn label — analyze.py's sequential-only
+                                                # exclusion logic still applies correctly
+                                                # there since L1 not being active is what
+                                                # SKIPs, same structural reason.
 }
 
 # ── Shapley correction ────────────────────────────────────────────────────────

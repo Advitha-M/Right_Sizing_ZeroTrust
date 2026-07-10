@@ -65,8 +65,13 @@ phase1(){
   helm repo add cilium https://helm.cilium.io/ >/dev/null 2>&1
   helm repo update >/dev/null
   step "Installing Cilium ${CILIUM_VERSION} (pinned — Tier-1 invariant expects this exact version)"
+  # hostFirewall.enabled=true is REQUIRED for controls/c1-l1/apply.sh's Part 4
+  # (VPC-segmentation proxy, CiliumClusterwideNetworkPolicy with nodeSelector)
+  # to actually enforce anything — without it those policies are accepted by
+  # the API but silently inert. Added here rather than left as a manual step.
   helm upgrade --install cilium cilium/cilium --version "${CILIUM_VERSION}" \
     --namespace kube-system \
+    --set hostFirewall.enabled=true \
     --wait --timeout 5m || echo "       (warn) Cilium install issue — verify later"
   step "Waiting for Cilium DaemonSet rollout"
   kubectl -n kube-system rollout status daemonset/cilium --timeout=180s \
@@ -208,7 +213,7 @@ phase4(){
 #           all explicitly assume this phase already ran.
 # ----------------------------------------------------------------------------
 phase5(){
-  banner "PHASE 5 : install Istio + OPA Gatekeeper + Vault (installed, NOT enforcing)"
+  banner "PHASE 5 : install Istio + OPA Gatekeeper + Vault + SPIRE + Dex (installed, NOT enforcing)"
 
   step "Installing istioctl + Istio control plane (minimal profile)"
   if ! command -v istioctl >/dev/null 2>&1; then
@@ -258,6 +263,98 @@ phase5(){
     || echo "       (warn) spire-server not Ready — check 'kubectl -n spire get pods'"
   kubectl -n spire rollout status daemonset/spire-agent --timeout=120s \
     || echo "       (warn) spire-agent DaemonSet not Ready — check 'kubectl -n spire get pods'"
+
+  step "Installing Dex (local OIDC identity provider, namespace 'dex') — cloud-IAM proxy for L1"
+  # Present, NOT wired into the apiserver yet — controls/c1-l1/apply.sh
+  # Part 3 patches the apiserver's --oidc-issuer-url et al. at C1, same
+  # "installed but not enforcing until its Controls/ apply.sh runs" pattern
+  # as everything else in this phase. Raw manifest (not a helm chart) for
+  # predictability: one static test user, one static client, short (30s)
+  # ID-token expiry so attack2.sh's t2-oidc-token-replay doesn't have to
+  # wait long for a captured token to actually expire.
+  kubectl create namespace dex --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  cat <<'DEXCFG' | kubectl apply -f - >/dev/null
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dex-config
+  namespace: dex
+data:
+  config.yaml: |
+    issuer: http://dex.dex.svc.cluster.local:5556/dex
+    storage:
+      type: memory
+    web:
+      http: 0.0.0.0:5556
+    oauth2:
+      responseTypes: ["code", "token", "id_token"]
+      skipApprovalScreen: true
+    expiry:
+      idTokens: "30s"
+    staticClients:
+      - id: zt-lab-kubectl
+        secret: zt-lab-kubectl-secret
+        name: zt-lab-kubectl
+        redirectURIs:
+          - http://localhost/callback
+        public: false
+    enablePasswordDB: true
+    staticPasswords:
+      - email: "attacker@zt-lab.local"
+        # bcrypt hash of "attacker-pw", generated and verified with
+        # bcrypt.checkpw() at authoring time (not copied from an example
+        # config where the plaintext might not actually match).
+        hash: "$2b$10$5SXv5Hj.yJYlXYxEYDo9GuEOIhxCCUBQ23cel2lbv2PZ7hIDVb1/G"
+        username: "attacker"
+        userID: "08a8684b-db88-4b73-90a9-3cd1661f5466"
+DEXCFG
+  cat <<'DEXDEPLOY' | kubectl apply -f - >/dev/null
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dex
+  namespace: dex
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: dex } }
+  template:
+    metadata: { labels: { app: dex } }
+    spec:
+      containers:
+        - name: dex
+          image: dexidp/dex:v2.41.1
+          args: ["dex", "serve", "/etc/dex/cfg/config.yaml"]
+          ports: [{ containerPort: 5556 }]
+          volumeMounts:
+            - { name: config, mountPath: /etc/dex/cfg }
+      volumes:
+        - name: config
+          configMap: { name: dex-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dex
+  namespace: dex
+spec:
+  selector: { app: dex }
+  ports: [{ port: 5556, targetPort: 5556 }]
+DEXDEPLOY
+  kubectl -n dex rollout status deployment/dex --timeout=90s \
+    || echo "       (warn) dex not Ready — check 'kubectl -n dex get pods'"
+
+  step "Labelling nodes for L1's VPC-segmentation proxy (vpc-regulated / vpc-general)"
+  # Static topology labels, applied here (not kind-cluster.yaml) so a
+  # cluster created before this addition still picks them up on a re-run of
+  # phase5. Enforcement itself (the CiliumClusterwideNetworkPolicy gating on
+  # this label) is applied/removed by controls/c1-l1/apply.sh Part 4, not
+  # here — this step only labels, matching c4-tenant-isolation's convention
+  # of discovering/labelling nodes at runtime rather than baking labels into
+  # kind-cluster.yaml.
+  kubectl label node -l tenant=tenant-finserv vpc=vpc-regulated --overwrite >/dev/null 2>&1 || true
+  kubectl label node -l tenant=tenant-partner vpc=vpc-regulated --overwrite >/dev/null 2>&1 || true
+  kubectl label node -l tenant=tenant-lowpriv vpc=vpc-general   --overwrite >/dev/null 2>&1 || true
+  kubectl label node -l tenant=tenant-saas    vpc=vpc-general   --overwrite >/dev/null 2>&1 || true
 
   echo "  PHASE 5 done. Tools installed; baseline behaviour UNCHANGED (still wide-open)."
 }

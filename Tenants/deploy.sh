@@ -95,7 +95,34 @@ for T in "${TENANTS[@]}"; do
   done
   # netshoot client pod for tests + attacks — digest-pinned (was nicolaka/netshoot:latest)
   CLIENT_IMAGE="$(resolve_digest nicolaka/netshoot:latest)"
-  kubectl apply -n "$T" -f - >/dev/null <<YAML
+  if [[ "$T" == "tenant-finserv" ]]; then
+    # tenant-finserv's client pod additionally mounts the mock PII/
+    # transaction-record PVC (finserv-data.yaml, applied below) read-only —
+    # this is what Attacks/attack7.sh's t1-direct-egress actually reads and
+    # exfiltrates, brief Section 13's tenant-finserv profile.
+    kubectl apply -n "$T" -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: client, namespace: $T }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: client } }
+  template:
+    metadata: { labels: { app: client, tenant: $T } }
+    spec:
+      nodeSelector: { tenant: $T }
+      containers:
+        - name: netshoot
+          image: "$CLIENT_IMAGE"
+          command: [ "sleep", "infinity" ]
+          volumeMounts:
+            - { name: finserv-data, mountPath: /data/finserv, readOnly: true }
+      volumes:
+        - name: finserv-data
+          persistentVolumeClaim: { claimName: finserv-mock-data }
+YAML
+  else
+    kubectl apply -n "$T" -f - >/dev/null <<YAML
 apiVersion: apps/v1
 kind: Deployment
 metadata: { name: client, namespace: $T }
@@ -109,7 +136,17 @@ spec:
       containers:
         - { name: netshoot, image: "$CLIENT_IMAGE", command: [ "sleep", "infinity" ] }
 YAML
+  fi
 done
+
+echo "[tenants] provisioning tenant-finserv's mock PII/transaction-record PVC"
+kubectl apply -f "${HERE}/finserv-data.yaml" >/dev/null
+kubectl wait --for=condition=complete job/finserv-data-seed -n tenant-finserv --timeout=90s \
+  || echo "  (warn) finserv-data-seed job did not complete in time — check 'kubectl -n tenant-finserv logs job/finserv-data-seed'"
+echo "  waiting for tenant-finserv's client pod to pick up the PVC mount (rollout restart)"
+kubectl rollout restart deployment/client -n tenant-finserv >/dev/null 2>&1 || true
+kubectl rollout status deployment/client -n tenant-finserv --timeout=90s \
+  || echo "  (warn) tenant-finserv client rollout slow — verify later"
 
 echo "[tenants] establishing C0 baseline (L3a/RBAC not yet applied — see header)"
 echo "  tenant-lowpriv: default SA = cluster-admin (removed by Controls/c2-rbac/apply.sh)"

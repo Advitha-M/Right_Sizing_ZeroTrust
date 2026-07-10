@@ -29,14 +29,33 @@ That analysis -- the Section 10.3 superadditivity test and the pair-level
 phi_DL_pair Shapley averaging -- is implemented here.
 
 -------------------------------------------------------------------------
-KNOWN GAP THIS SCRIPT DOES NOT PAPER OVER
+(L2,L3a) DATA SOURCE
 -------------------------------------------------------------------------
-samplers.py is explicit that l2_l3a_separation_sampler does not exist yet
-("deferred to a k3s-based implementation") and driver.py's --mode
-l2-l3a-sep is disabled. (L2,L3a) -- the one DL-only candidate pair --
-currently has no dedicated solo-DL data in results.db. Every function below
-that touches (L2,L3a) DL work detects this (zero rows) and reports it as
-unavailable rather than fabricating a number.
+L2 is the fixed base layer everywhere else in this codebase, so
+shapley_pair_sampler (Section 8's ASR-constrained pairs) never varies it,
+and dl_robustness_sampler's own precursor/with cut only ever moves L3a
+around a stack where L2 is already permanently active. Neither source can
+produce the independent solo_L2 / solo_L3a points DL_solo_best needs
+(brief Section 10.2). That data comes from the dedicated k3s-only sampler
+in samplers_l2l3a_k3s.py (l2_l3a_separation_sampler, driven by driver.py's
+run_l2_l3a_sep() / --mode l2-l3a-sep), which treats L2 as genuinely
+toggleable via Controls/c-l2-audit and records the same precursor/with
+pair for L2 that shapley_pair_sampler records for every other focus layer.
+This module regenerates that sampler's output the same way it regenerates
+shapley_pair_sampler's (see CONFIG-LABEL RESOLUTION above) and reads its
+"_pre_L2"/"_with_L2"/"_pre_L3a"/"_with_L3a" rows from results.db.
+
+The Section 10.3 superadditivity test's joint/without comparison still
+comes from the ordinary KIND-based dl_robustness_sampler run --
+--mode dl-robust already covers (L2,L3a) like the other two DL candidate
+pairs, since L2 being fixed-active there too means its "_precursor"/"_with"
+cut already isolates L3a's marginal effect on top of an L2-present stack.
+
+If --mode l2-l3a-sep was never run for a given run_id, the k3s-sourced
+queries above simply come back empty and every function below reports the
+result as unavailable (insufficient data) rather than fabricating a number
+-- the same convention used everywhere else in this file when a query
+comes back empty.
 
 -------------------------------------------------------------------------
 CONFIG-LABEL RESOLUTION
@@ -68,9 +87,10 @@ import numpy as np
 from constants import (
     BASE_LAYER, PERMUTABLE_LAYERS, BASELINE_LAYERS, CONFIGS, CONDITION_ORDER,
     CONSTRAINED_PAIRS_ASR, DL_CANDIDATE_PAIRS, DL_ROBUSTNESS_SAMPLES,
-    TECHNIQUE_SETS,
+    L2_L3A_SEPARATION_SAMPLES, TECHNIQUE_SETS,
 )
 from samplers import shapley_pair_sampler, dl_robustness_sampler
+from samplers_l2l3a_k3s import l2_l3a_separation_sampler
 from analysis_common import (
     ATTACK_CLASSES, connect, resolve_run_id, load_rows, filter_rows,
     mixture_asr, dl_median, dl_nondetect, gated_delta_asr, gated_delta_dl,
@@ -146,6 +166,32 @@ def shapley_draws(run_id, mc_permutations=None):
                                  seed=mc_seed_for(run_id))
 
 
+def l2_l3a_draws(run_id):
+    """Regenerate the exact l2_l3a_separation_sampler (samplers_l2l3a_k3s.py)
+    output for this run_id -- the k3s-only counterpart to shapley_draws(),
+    for (L2,L3a), the one DL candidate pair that isn't in
+    CONSTRAINED_PAIRS_ASR and so never appears in shapley_draws()'s output.
+    Uses the same mc_seed_for(run_id) seed driver.py's run_l2_l3a_sep()
+    derives its Monte Carlo seed from, so the regenerated draws line up
+    with the "_pre_L2"/"_with_L2"/"_pre_L3a"/"_with_L3a" rows that run
+    actually wrote to results.db."""
+    return l2_l3a_separation_sampler(M_prime=L2_L3A_SEPARATION_SAMPLES,
+                                      seed=mc_seed_for(run_id))
+
+
+def draws_for_pair(la, lb, shapley_draw_list, run_id):
+    """Return the sampler draws that cover this DL candidate pair's solo
+    (precursor/with) measurement points. (L5,L6) and (L1,L7) are also
+    ASR-constrained pairs, so their per-layer precursor/with draws already
+    exist in shapley_draw_list (regenerated once per run_id by
+    shapley_draws()). (L2,L3a) is DL-only -- L2 is fixed-active everywhere
+    shapley_pair_sampler runs, so it never appears there -- and its draws
+    instead come from l2_l3a_draws()."""
+    if pair_key(la, lb) == pair_key("L2", "L3a"):
+        return l2_l3a_draws(run_id)
+    return shapley_draw_list
+
+
 def shapley_phi_asr(conn, la, lb, attack_class, draws, run_id):
     pair_draws = [d for d in draws if d.focus_layers == (la, lb)]
     results = {}
@@ -204,13 +250,11 @@ def build_phi_table(conn, run_id, mc_permutations=None):
 def dl_solo_best(conn, la, lb, attack_class, technique, draws, run_id):
     """DL_solo_best = MIN(solo_A, solo_B) -- VALIDATION ONLY, never a formula
     input to phi_DL_pair (Section 10.2). Purity-filtered: a draw's 'with_a'
-    point only counts toward solo_A if Lb is genuinely absent from it."""
-    pk = pair_key(la, lb)
-    if pk == pair_key("L2", "L3a"):
-        return None, {"note": "sampler not implemented for (L2,L3a) -- "
-                               "samplers.py: l2_l3a_separation_sampler is deferred "
-                               "to a k3s-based implementation; no solo-DL data exists "
-                               "for this pair in the current pipeline."}
+    point only counts toward solo_A if Lb is genuinely absent from it.
+    `draws` must already be the sampler output that actually covers
+    (la, lb) -- callers should pass draws_for_pair(la, lb, ..., run_id)
+    rather than assuming shapley_draw_list covers every DL candidate pair
+    (it doesn't: (L2,L3a) is sourced from l2_l3a_draws() instead)."""
     pair_draws = [d for d in draws if d.focus_layers == (la, lb)]
     solo_vals = {"A": [], "B": []}
     for role, focus, other, with_attr in (("A", la, lb, "with_a"), ("B", lb, la, "with_b")):
@@ -244,16 +288,13 @@ def superadditivity_test(conn, la, lb, attack_class, shapley_draw_list, run_id):
     dl_joint < solo_best, Wilcoxon-gated (Bonferroni/7, |r|>=0.20).
     """
     pk = pair_key(la, lb)
-    if pk == pair_key("L2", "L3a"):
-        return {"note": "unavailable -- (L2,L3a) separation sampler not implemented "
-                         "(see samplers.py); no superadditivity test possible with "
-                         "current data."}
     from analysis_common import wilcoxon_p, rank_biserial_matched, is_detected, latency, paired_by_trial, BONFERRONI_ALPHA, COHENS_H_MIN  # noqa: E501
-    valid_techs = dl_valid_techniques(pk, attack_class)
+    valid_techs = dl_valid_techniques((la, lb), attack_class)
     out = {}
     r_draws = robustness_draws((la, lb), run_id)
+    solo_draw_source = draws_for_pair(la, lb, shapley_draw_list, run_id)
     for t in valid_techs:
-        solo_best, solo_detail = dl_solo_best(conn, la, lb, attack_class, t, shapley_draw_list, run_id)
+        solo_best, solo_detail = dl_solo_best(conn, la, lb, attack_class, t, solo_draw_source, run_id)
         joint_rows, without_rows = [], []
         for d in r_draws:
             joint_rows += list(load_rows(conn, f"{d.sample_id}_with", attack_class, technique=t, run_id=run_id))
@@ -282,9 +323,6 @@ def phi_dl_pair(conn, la, lb, attack_class, technique, run_id):
     """Section 10: pair-level phi_DL_pair from the M''=15 robustness draws,
     self-contained -- not derived from DL_solo_best, never decomposed
     per-layer (Section 15 item 13)."""
-    pk = pair_key(la, lb)
-    if pk == pair_key("L2", "L3a"):
-        return {"phi_dl_pair": None, "note": "unavailable -- separation sampler not implemented"}
     r_draws = robustness_draws((la, lb), run_id)
     deltas = []
     for d in r_draws:
@@ -305,7 +343,7 @@ def run_dl_pipeline(conn, run_id, mc_permutations=None):
         pk = pair_key(la, lb)
         report[pk] = {}
         for j in ATTACK_CLASSES:
-            techs = dl_valid_techniques(pk, j)
+            techs = dl_valid_techniques((la, lb), j)
             if not techs:
                 continue
             supertest = superadditivity_test(conn, la, lb, j, shapley_draw_list, run_id)
@@ -343,11 +381,15 @@ def run_deliverable_a(conn, run_id, mc_permutations=None):
             for (la, lb, j, t) in confirmed_dropper_pairs
         ],
         "known_gaps": [
-            "(L2,L3a) has no DL solo-contribution or superadditivity data: "
-            "samplers.py's l2_l3a_separation_sampler is deferred to a "
-            "k3s-based implementation and driver.py's --mode l2-l3a-sep is "
-            "disabled. phi_DL_pair and DL_solo_best for this pair report as "
-            "unavailable rather than being estimated from unrelated data.",
+            "(L2,L3a)'s DL_solo_best is sourced from "
+            "samplers_l2l3a_k3s.l2_l3a_separation_sampler's k3s-only "
+            "'_pre_L2'/'_with_L2'/'_pre_L3a'/'_with_L3a' rows (driver.py "
+            "--mode l2-l3a-sep); its superadditivity test and phi_DL_pair "
+            "reuse the ordinary --mode dl-robust joint/without run, same as "
+            "the other two DL candidate pairs. If --mode l2-l3a-sep was "
+            "never run for this run_id, the k3s-sourced queries come back "
+            "empty and this pair reports as unavailable (insufficient "
+            "data) rather than an estimate derived from unrelated data.",
         ],
     }
 

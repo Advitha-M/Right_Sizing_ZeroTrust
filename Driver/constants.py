@@ -1,12 +1,37 @@
 """
 constants.py — single source of truth for all shared vocabulary.
-Revision 6 — see agent_implementation_brief_v6.docx for the full
-reconciliation record. Every value here reflects author-directed
-corrections; where this file conflicts with the Rev5 spec docs or the
-"comprehensive" agent brief, THIS FILE (and v6) wins.
 
-Imported by: driver.py, config.py, analyze.py, compositional.py, samplers.py
-Never import from each other to get these values — always import from here.
+Revision 7 — see agent_implementation_brief_v7_deliverableA.docx for the
+authoritative spec. This file's *values* were carried forward from the v6
+reconciliation and then updated in place for each Rev7 correction; it does
+not override the brief the way the old Rev6 header claimed — the brief is
+authoritative, and this file exists to give every Rev7 value a single,
+importable home instead of being hand-copied into driver.py, samplers.py,
+analysis_common.py, and deliverable_a.py/b.py separately. Where a Rev7
+change to this file supersedes a Rev5/Rev6 assumption, that is called out
+inline, next to the value it changed, rather than declared globally here.
+
+Rev7 changes reflected below (see each value's own comment for detail):
+  - Section 1:  L2 is the sole base layer; L1 is independently toggleable
+                and freely permutable (PERMUTABLE_LAYERS, CONFIGS).
+  - Section 4:  Primary build is 8 conditions, C0..C7 (CONFIGS,
+                CONDITION_ORDER), each with an independent N=50 run.
+  - Section 8:  CONSTRAINED_PAIRS_ASR now includes (L1,L7); PAIR_MC_SAMPLES
+                is the non-uniform 15/30/30 allocation, not a flat M=30.
+  - Section 8.3: (L2,L3a)'s k3s-only M'/M'' sampling frees L2's position —
+                this is a Rev7 correction of the prior "L2 hard-fixed"
+                assumption (see samplers_l2l3a_k3s.py, which implements it;
+                L2_L3A_SEPARATION_SAMPLES / DL_ROBUSTNESS_SAMPLES below are
+                just the sample-size constants, not the position rule).
+  - Section 10: DL_solo_best, dl_joint_T, and phi_DL_pair are removed from
+                the study entirely, replaced by delta_dl_solo/
+                delta_dl_joint computed in deliverable_a.py directly from
+                sampler output. No constant in this file names or computes
+                any of the three removed quantities.
+
+Imported by: driver.py, config.py, samplers.py, samplers_l2l3a_k3s.py,
+analysis_common.py, deliverable_a.py, deliverable_b.py.
+Never re-derive these values elsewhere — always import from here.
 """
 
 # ── Layer universe ────────────────────────────────────────────────────────────
@@ -286,26 +311,47 @@ PAIR_MC_SAMPLES = {
 # DL candidate pairs (architecturally determined, Rev5 §7.1) — unchanged by v6.
 DL_CANDIDATE_PAIRS = [("L5", "L6"), ("L1", "L7"), ("L2", "L3a")]
 
-# Dedicated separation-sample size for the DL-only pair (L2,L3a) — v6 confirms
-# L2's position is fixed (hard precedence: L2 always precedes L3a), only
-# L3a's position varies.
+# Dedicated separation-sample size (brief Section 8.1's M'=15 row) for the
+# DL-only pair (L2,L3a). REV 7 CORRECTION: the v6 assumption that L2's
+# position is hard-fixed here (L2 always precedes L3a, only L3a varies) is
+# retracted by brief Section 8.2/8.3 — on k3s, scoped narrowly to this
+# pair's M'/M'' sampling, BOTH L2 and L3a are independently inserted and
+# vary freely, "4-augment structure applies with no exception." This
+# constant is just the sample count; the actual freely-varying-L2 mechanic
+# lives in samplers_l2l3a_k3s.l2_l3a_separation_sampler(), which the M'
+# sampling here (driver.py --mode l2-l3a-sep) uses instead of
+# samplers.py's ordinary samplers (which still hard-fix L2, correctly, for
+# every context outside this one pair — see BASE_LAYER / PERMUTABLE_LAYERS
+# above).
 L2_L3A_SEPARATION_SAMPLES = 15
 
-# DL robustness sample size — applies to ALL THREE DL candidate pairs after
-# each individually passes its superadditivity test (v6 Section 4.2).
+# DL robustness sample size (M''=15) — applies to ALL THREE DL candidate
+# pairs, unconditionally, per brief Section 10.6's correction: M'' now runs
+# for every (pair,j,T) rather than being gated behind a prior confirmation
+# step. For (L2,L3a) specifically, these M''=15 draws also run on k3s with
+# L2 freely permutable (driver.l2_l3a_robustness_draws_k3s()), not the
+# ordinary KIND-based dl_robustness_sampler() the other two pairs use.
 DL_ROBUSTNESS_SAMPLES = 15
 
-# phi_DL_pair (v6 Section 5): pair-level ONLY, never split per layer.
-# Computed directly from the M''=15 robustness-run output via Shapley-style
-# averaging over the pair's sampled orderings — self-contained, no
-# dependency on DL_solo_best or any other precomputed value. DL_solo_best
-# is used ONLY as a separate downstream validation check (phi_DL_pair must
-# beat MIN(delta_dl_solo(La), delta_dl_solo(Lb))), never as a formula input.
-PHI_DL_PAIR_NOTE = (
-    "phi_DL_pair computed directly from M''=15 Shapley averaging over "
-    "sampled orderings. DL_solo_best = MIN(delta_dl_solo per layer) is "
-    "validation-only, applied AFTER phi_DL_pair is computed, never as an "
-    "input to it. Never decomposed into per-layer phi_DL values."
+# DL pipeline outputs (brief Section 10, Rev 7 rewrite): DL_solo_best,
+# dl_joint_T, and phi_DL_pair are REMOVED from the study entirely and must
+# not be reintroduced. They are replaced by two delta-space quantities,
+# both computed in deliverable_a.py directly from sampler output (nothing
+# in this file names or precomputes either):
+#   delta_dl_solo(La/Lb, j, T)   — Section 10.3, from M/M' draws, per layer
+#   delta_dl_joint(La, Lb, j, T) — Section 10.3, from M''=15 robustness
+#                                   draws, pair-level only
+# The Section 10.6 superadditivity test compares these directly: reject H0
+# iff a one-sample Wilcoxon of [delta_dl_joint(m) - MAX(delta_dl_solo(La),
+# delta_dl_solo(Lb))] is significantly greater than zero (Bonferroni/7 AND
+# rank-biserial r>=0.20). Note the comparator is MAX, not the old MIN —
+# the pair must out-improve the BETTER of its two solo layers, a strictly
+# harder bar than the retracted formulation this note used to describe.
+DL_PIPELINE_NOTE = (
+    "Rev 7: delta_dl_solo/delta_dl_joint only, both in delta space, both "
+    "computed in deliverable_a.py from sampler output. DL_solo_best, "
+    "dl_joint_T, and phi_DL_pair are retracted and must not appear "
+    "elsewhere in this codebase as computed quantities."
 )
 
 # ── Significance thresholds ───────────────────────────────────────────────────

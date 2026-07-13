@@ -1,7 +1,7 @@
 """
 samplers_l2l3a_k3s.py — dedicated (L2,L3a) separation sampler, k3s ONLY.
 
-Scope: brief Section 4.2's M'=15 dedicated separation sample for the one DL
+Scope: brief Section 8.1's M'=15 dedicated separation sample for the one DL
 candidate pair that dl_robustness_sampler (samplers.py) cannot measure
 correctly: (L2, L3a).
 
@@ -12,15 +12,16 @@ Why this lives in its own module instead of samplers.py:
   at cluster bootstrap, never toggled by a Controls/ apply.sh/remove.sh
   pair. samplers._build_order() encodes this directly: it unconditionally
   prepends BASELINE_LAYERS (= ["L2"]) to every sample it builds, for all
-  three samplers in that module, including the (L2,L3a) branch of
-  dl_robustness_sampler. That means dl_robustness_sampler's own self-check
-  claim ("works the same way for all three pairs") is not actually true for
-  (L2,L3a): L2 never moves, so only L3a's position is ever varied there,
-  and dl_robustness_sampler's joint precursor/active model only records ONE
-  measurement pair for the whole unit anyway — it cannot produce the
-  independent per-layer solo_A / solo_B points DL_solo_best needs (brief
-  Section 10.2's pseudocode for (L2,L3a) is explicit that L2's solo config
-  must be measured, not assumed fixed).
+  three samplers in that module. dl_robustness_sampler() in samplers.py is
+  only ever invoked for (L5,L6) and (L1,L7) in this pipeline for exactly
+  this reason (see that function's own docstring) — for (L2,L3a), L2 would
+  never move there, so only L3a's position would vary, and its joint
+  precursor/active model only records ONE measurement pair for the whole
+  unit anyway. Neither limitation is acceptable for (L2,L3a): it cannot
+  produce the independent per-layer solo points delta_dl_solo(L2,...) /
+  delta_dl_solo(L3a,...) need (brief Section 10.3's definition for a
+  DL-only pair requires L2's solo config to be genuinely measured, not
+  assumed fixed).
 
   This sampler instead mirrors shapley_pair_sampler's mechanics exactly:
   both L2 and L3a are independently inserted into a shuffled permutation of
@@ -70,7 +71,10 @@ def l2_l3a_separation_sampler(
 
     Each draw records the same 4 measurement points shapley_pair_sampler
     produces, needed to compute L2's and L3a's marginal DL contributions
-    independently (DL_solo_best, brief Section 10.2):
+    independently as delta_dl_solo(L2,...) / delta_dl_solo(L3a,...)
+    (brief Section 10.3; DL_solo_best is the retracted Rev5/v6 quantity
+    this replaces, per Section 10's removal note — not something this
+    sampler computes or feeds):
       precursor_a: the stack immediately BEFORE L2 is added
       with_a:      the stack immediately AFTER L2 is added
       precursor_b: the stack immediately BEFORE L3a is added

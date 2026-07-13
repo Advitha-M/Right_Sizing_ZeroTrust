@@ -150,23 +150,31 @@ def dl_robustness_sampler(
     seed: Optional[int] = None,
 ) -> list[SampledCondition]:
     """
-    Applies to a DL candidate pair: (L5,L6), (L1,L7), or (L2,L3a). Treats
-    the pair as a single joint unit and varies its position within the
-    stack across M_double_prime draws. Works the same way for all three
-    pairs, including (L2,L3a).
+    Generic KIND-based M''=15 robustness sampler (brief Section 10.2's
+    2-augment "before pair / with pair" form). In the current Rev 7
+    pipeline this is used for (L5,L6) and (L1,L7) only — both stay on
+    KIND with L2 hard-fixed as base, so treating the pair as a single
+    joint unit inserted into PERMUTABLE_LAYERS is correct for them.
+
+    (L2,L3a) is NOT routed through this sampler for its M''=15 robustness
+    draws. Brief Section 8.3 requires (L2,L3a)'s M'' draws to also run on
+    k3s with L2 freely permutable, "no special-casing" relative to the
+    other two pairs — but this sampler's _build_order() unconditionally
+    prepends BASELINE_LAYERS (= ["L2"]) to every sample, which would
+    silently keep L2 fixed-active and defeat that requirement. deliverable
+    _a.py's robustness_draws_for_pair() and driver.py's run_dl_robust()
+    both special-case (L2,L3a) to call
+    driver.l2_l3a_robustness_draws_k3s() instead, which mirrors this
+    function's 2-augment shape but independently inserts both L2 and L3a
+    into the permutation (see samplers_l2l3a_k3s.py for the sibling
+    M'=15 sampler that does the analogous thing for the 4-augment case).
+    This function accepts (L2,L3a) as a `confirmed_pair` argument without
+    erroring, but nothing in the current pipeline calls it that way —
+    if something ever does, note that L2 will incorrectly stay fixed.
 
     Each draw records two measurement points:
       precursor_layers: the stack immediately BEFORE the pair is added
       active_layers:    the stack immediately AFTER the pair is added
-
-    For (L2,L3a): L2 is the base layer and is always already present in
-    precursor_layers, so the only layer that actually differs between the
-    two points is L3a.
-
-    Not implemented here: a separate, dedicated (L2,L3a) separation
-    sampler (brief §4.2's M'=15 line) that measures L3a's solo DL
-    contribution independent of this robustness pass. That sampler is
-    deferred to a k3s-based implementation elsewhere.
     """
     rng    = random.Random(seed)
     la, lb = confirmed_pair
@@ -197,9 +205,12 @@ def dl_robustness_sampler(
             note=f"Precursor stack ends at position {precursor_cut}; "
                  f"joint ({la},{lb}) added at positions "
                  f"{precursor_cut + 1}-{with_cut}. "
-                 f"phi_DL_pair computed directly from this M''={M_double_prime} "
-                 f"output via Shapley averaging — self-contained, not derived "
-                 f"from DL_solo_best.",
+                 f"delta_dl_joint (brief Section 10.3) computed directly "
+                 f"from this M''={M_double_prime} output's precursor/with "
+                 f"pairs — not derived from delta_dl_solo or any per-layer "
+                 f"value (delta_dl_solo/DL_solo_best/phi_DL_pair are a "
+                 f"separate, per-layer quantity computed from M/M' draws, "
+                 f"not from this sampler's output).",
         ))
     return out
 

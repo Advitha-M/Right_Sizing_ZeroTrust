@@ -179,10 +179,26 @@ ATTACK_CLASSES = {
 # without updating BOTH this dict and the corresponding script.
 # |T| sizes: A1=3, A2=3, A3=2, A4=1, A5=3, A6=1, A7=2  (sum=15)
 # Risk tiers: High=3 (A1,A2,A5) Medium=2 (A3,A7) Low=1 (A4,A6)
+#
+# CORRECTED (Rev 7 validation pass): A2's T2/T3 previously read
+# "t2-token-replay-expired"/"t3-cert-identity-spoof" here, which did NOT
+# match Attacks/attack2.sh's actual TECHNIQUES=() array
+# ("t2-oidc-token-replay"/"t3-spiffe-svid-forgery") despite this block's own
+# claim to be verified against it. attack2.sh's names were kept (they match
+# the brief's Appendix A wording — "OIDC Token Replay" / "SPIFFE SVID
+# Forgery" — and are also what TECHNIQUE_MIN_CONDITION below and every other
+# file in this repo already used); this dict was the outlier and is now
+# corrected to match. Previously, driver.py's draw_technique() picked the
+# *label* recorded to results.db from this dict while attack2.sh indexed its
+# own differently-named array by the same integer — same technique
+# executed, but the DB's technique_token for A2-T2/T3 didn't describe it,
+# which silently broke TECHNIQUE_MIN_CONDITION's ("A2","t2-oidc-token-replay")
+# key (it could never match the stale recorded string) and mislabeled every
+# A2 per-technique ASR/DL breakdown.
 
 TECHNIQUE_SETS = {
     "A1": ["t1-crb-cross-namespace", "t2-pvc-mismatch", "t3-direct-pod-api"],
-    "A2": ["t1-sa-token-theft", "t2-token-replay-expired", "t3-cert-identity-spoof"],
+    "A2": ["t1-sa-token-theft", "t2-oidc-token-replay", "t3-spiffe-svid-forgery"],
     "A3": ["t1-scoped-binding-escalation", "t2-wildcard-clusterrole"],
     "A4": ["t1-tool-enumeration"],
     "A5": ["t1-sa-token-reuse", "t2-network-pivot", "t3-secret-projection-leak"],
@@ -325,3 +341,28 @@ TENANTS = {
 }
 VICTIM_NS  = "tenant-finserv"
 PARTNER_NS = "tenant-partner"
+
+# ── A7 burst-load study parameters (brief Section 12) ────────────────────────
+# "tenant-saas: ResourceQuota sized to allow burst up to 3x quota... Source
+# of A7 burst load." / "A7 scope constraint (burst load): burst load from
+# tenant-saas must not spike system pool CPU above 60%. Calibrate multiplier
+# before main study; lock it as a study parameter."
+#
+# Previously unimplemented entirely: tenant-saas got the identical
+# ResourceQuota as every other tenant (Controls/c4-tenant-isolation/
+# apply.sh), and no burst-load generator existed anywhere in the repo.
+#
+# BURST_QUOTA_MULTIPLIER is the "lock it as a study parameter" value the
+# brief calls for. 3x matches Section 12's tenant table verbatim ("burst up
+# to 3x quota"). This is a fixed default, not empirically re-calibrated
+# against a live cluster by this codebase — same honesty standard as this
+# file's other proxy/scope notes (L1_SCOPE_NOTE etc.): documented as a
+# locked parameter, not silently invented or left unset. Re-run
+# Tenants/burst_load.sh's calibration pass (see its header) before a real
+# study run if the underlying node sizing changes.
+BURST_QUOTA_MULTIPLIER = 3
+
+# The hard ceiling the burst generator must self-throttle against — distinct
+# from Section 11 Tier 2's separate, more permissive "system pool CPU below
+# 70%" general invariant. This 60% figure is A7-burst-specific.
+SYSTEM_POOL_CPU_BURST_CAP_PCT = 60

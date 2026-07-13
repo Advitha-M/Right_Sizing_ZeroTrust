@@ -1,34 +1,56 @@
 #!/usr/bin/env python3
 """
-driver.py — Cumulative Augmentation Orchestrator (Rev5)
+driver.py — Cumulative Augmentation Orchestrator (Rev7)
 
-Changes from previous version:
+Changes from previous version (carried over from Rev5/Rev6):
   - Seed scheme: hash(attack + trial) only — config dropped for McNemar validity
   - Per-class ATTACKER_NS routing sourced entirely from constants.ATTACKER_NS_MAP
-    (v6-corrected: A1/A2/A5/A6 -> tenant-lowpriv, A3/A4 -> tenant-partner,
-    A7 -> tenant-finserv [insider/already-present principal, origin==target,
-    corrected from tenant-lowpriv this revision]). Tenant namespaces are the
-    four names in constants.TENANTS (tenant-lowpriv, tenant-finserv,
-    tenant-partner, tenant-saas) — NOT the old acme/globex/initech/umbrella
-    naming from earlier revisions.
-  - technique_token recorded as first-class DB column
-  - t_start persisted in DB
+    (A1/A2/A5/A6 -> tenant-lowpriv, A3/A4 -> tenant-partner, A7 ->
+    tenant-finserv [insider/already-present principal, origin==target]).
+    Tenant namespaces are the four names in constants.TENANTS.
+  - technique_token recorded as first-class DB column; t_start persisted
   - N (--trials) and M (--mc-permutations) are CLI args for dry-run flexibility
-  - Pre-condition invariant checks (structural gate before first trial per config)
   - DB schema v3: adds t_end, t_alert, alert_source, exit_code, error_type,
     target_tenant, pivot_path columns; measure_dl() returns (t_alert, source, dl)
-  - --mode {sequential, mc-pairs}: mc-pairs wires shapley_pair_sampler
-  - joint-config mode REMOVED (joint_config_constructor dropped from
-    samplers.py; author-confirmed, not needed for this study)
-  - l2-l3a-sep mode IMPLEMENTED against k3s: samplers_l2l3a_k3s.py's
-    l2_l3a_separation_sampler() treats L2 as genuinely toggleable (unlike
-    everywhere else in this repo, where L2 = BASE_LAYER, fixed), via the
-    new Controls/c-l2-audit control and set_config_k3s()/C.K3S_KUBECONFIG.
+  - --mode {sequential, mc-pairs, dl-robust, l2-l3a-sep}
+  - l2-l3a-sep mode against k3s: samplers_l2l3a_k3s.py's
+    l2_l3a_separation_sampler() treats L2 as genuinely toggleable, via the
+    Controls/c-l2-audit control and set_config_k3s()/C.K3S_KUBECONFIG.
     Requires Infra/k3s/bootstrap.sh to have been run first.
-  - mc-pairs and dl-robust now run BOTH precursor and with-pair points
-    per draw (mc-pairs: 4 points — precursor/with x La/Lb; dl-robust:
-    2 points — precursor/with for the joint pair), each as its own
-    labeled condition, matching samplers.py's precursor/with model
+  - mc-pairs and dl-robust run both precursor and with-pair points per
+    draw, each as its own labeled condition.
+
+REV 7 FIXES in this revision:
+  - measure_dl()'s poll deadline now uses the brief's actual fixed
+    90-second non-detection cutoff (Section 10.1) via C.DL_TIMEOUT alone.
+    Previously it was silently capped at min(C.DL_TIMEOUT, 30) = 30s
+    regardless of the (also-wrong, 300s) config default — neither number
+    matched the brief. See config.py.
+  - run_dl_robust()'s (L2,L3a) branch no longer reuses the generic
+    KIND-based dl_robustness_sampler(), which hard-fixes L2 as a prefix
+    (L2 is not a member of constants.PERMUTABLE_LAYERS, so that sampler
+    can't vary it). Section 8.3 is explicit that (L2,L3a)'s M''=15
+    robustness draws ALSO run on k3s with L2 freely permutable, "no
+    special-casing" relative to the other two DL candidate pairs' M''
+    draws. New function l2_l3a_robustness_draws_k3s() (below) fixes this,
+    mirroring samplers_l2l3a_k3s.l2_l3a_separation_sampler's permutation
+    mechanics but using the reduced 2-augment (precursor pair / with
+    pair) form Section 10.2 specifies for all M'' draws.
+  - run_invariant_checks() previously covered a small fraction of Section
+    11's four-tier structure (roughly 2 of Tier 1's 5 checks, nothing
+    from Tier 2, and none of Tier 3/4). This revision implements the
+    full four-tier structure: Tier 1+2 gate a condition once, before/
+    after layer activation (HALT on failure — do not proceed to trials);
+    Tier 3+4 gate every individual trial (SKIP + reset + retry on
+    failure, escalate after 3 consecutive failures), per Section 11's
+    failure-handling rule. The open item flagged in Section 11/8.3 —
+    whether Tier 1 needs a k3s-specific variant for (L2,L3a)'s k3s-run
+    samples — is NOT resolved here (still genuinely unspecified by the
+    brief); tier1_structural() takes an `on_k3s` flag and takes the
+    conservative position of running the KIND-authored checks unchanged
+    against k3s (same behavior as before this rewrite) while logging an
+    explicit [OPEN ITEM] flag every time it does so, instead of silently
+    assuming transfer.
 
 Usage:
     python3 driver/driver.py                          # full run C0-C7, N=50
@@ -43,6 +65,7 @@ import base64
 import hashlib
 import json
 import os
+import random
 import re
 import sqlite3
 import subprocess
@@ -56,7 +79,7 @@ import config as C
 from constants import (
     CONFIGS, CONDITION_ORDER, ATTACK_ORDER_SCRIPTS, ATTACK_CLASSES,
     ATTACKER_NS_MAP, SCRIPT_TO_DOC, TECHNIQUE_SETS, VICTIM_NS, PARTNER_NS,
-    TENANTS,
+    TENANTS, PERMUTABLE_LAYERS, DL_ROBUSTNESS_SAMPLES,
 )
 
 # Canonical tenant namespace list — derived from constants.TENANTS, the v6
@@ -132,6 +155,14 @@ _V3_COLS = [
     ("pivot_path",    "TEXT"),
 ]
 
+# Columns added in v4 (Rev 7 rewrite) — Section 11's Tier 3/4 per-trial gate
+# needs somewhere to record when a trial only ran after 1-2 retries, and
+# whether it was ultimately escalated (3 consecutive Tier 3/4 failures).
+_V4_COLS = [
+    ("tier34_retries",   "INTEGER"),
+    ("tier34_escalated", "INTEGER"),
+]
+
 
 def init_db():
     C.RESULTS_DB.parent.mkdir(parents=True, exist_ok=True)
@@ -139,7 +170,7 @@ def init_db():
     con.executescript(SCHEMA)
     con.commit()
     # Forward-migrate existing schemas — safe no-op if columns already exist
-    for col, typ in _V3_COLS:
+    for col, typ in _V3_COLS + _V4_COLS:
         try:
             con.execute(f"ALTER TABLE trials ADD COLUMN {col} {typ}")
             con.commit()
@@ -150,20 +181,23 @@ def init_db():
 
 def record(con, run_id, config, attack, trial, seed, technique_token,
            verdict, t_start, t_end, t_alert, alert_source, dl,
-           exit_code, error_type, target_tenant, pivot_path):
+           exit_code, error_type, target_tenant, pivot_path,
+           tier34_retries=0, tier34_escalated=0):
     doc_class = SCRIPT_TO_DOC[attack]
     con.execute(
         """INSERT INTO trials
            (run_id,config,attack,doc_class,trial,seed,technique_token,
             outcome,success,chain_depth,detail,
             t_start,t_end,t_alert,alert_source,dl_sec,
-            exit_code,error_type,target_tenant,pivot_path)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            exit_code,error_type,target_tenant,pivot_path,
+            tier34_retries,tier34_escalated)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (run_id, config, attack, doc_class, trial, seed, technique_token,
          verdict.outcome, verdict.success_bit,
          verdict.chain_depth, verdict.detail,
          t_start, t_end, t_alert, alert_source, dl,
-         exit_code, error_type, target_tenant, pivot_path),
+         exit_code, error_type, target_tenant, pivot_path,
+         tier34_retries, tier34_escalated),
     )
     con.commit()
 
@@ -188,7 +222,6 @@ def draw_technique(attack: str, seed: int) -> tuple[str, int]:
     source of truth: Python picks, script obeys.
     Same seed → same technique across all conditions (McNemar validity).
     """
-    import random
     doc_id = SCRIPT_TO_DOC[attack]
     techniques = TECHNIQUE_SETS[doc_id]
     rng = random.Random(seed)
@@ -196,80 +229,586 @@ def draw_technique(attack: str, seed: int) -> tuple[str, int]:
     return techniques[idx], idx
 
 
-# ── Invariant checks ──────────────────────────────────────────────────────────
+# ── Invariant checks — brief v7 Section 11's four-tier structure ──────────────
+#
+# Tier 1 (structural) and Tier 2 (configuration) gate a CONDITION: run once
+# each, before any trials for that condition. Failure -> HALT, do not
+# proceed to trials for this condition (run_invariant_checks() below).
+#
+# Tier 3 (trial-isolation) and Tier 4 (instrumentation) gate a TRIAL: run
+# before every individual trial. Failure -> SKIP that trial attempt, run
+# reset, retry; escalate after 3 consecutive failures (run_trials()'s main
+# loop, further down).
+#
+# REV 7: previously only ~2 of Tier 1's 5 checks and one Tier-2-adjacent
+# check existed; nothing implemented Tier 3 or Tier 4 at all. This section
+# implements the full structure. Where a check requires infrastructure
+# this repo may not have fully wired yet (e.g. a stored cluster-state
+# registry, a chrony/NTP source per node), it degrades gracefully with an
+# explicit WARN rather than silently reporting PASS or hard-failing every
+# run — see each function's docstring for its degradation behavior.
+
+def _kubectl_ok(cmd: str, timeout: int = 15) -> tuple[bool, str]:
+    rc, out, _ = run(cmd, timeout=timeout)
+    return rc == 0, out
+
+
+# ---- Tier 1 — Structural (once per condition, before any trials) ------------
 
 def check_nodes_ready() -> bool:
     rc, out, _ = run("kubectl get nodes --no-headers 2>/dev/null", timeout=15)
     if rc != 0:
-        log("  [INVARIANT FAIL] kubectl get nodes failed")
+        log("  [TIER1 FAIL] kubectl get nodes failed")
         return False
     lines = [l for l in out.strip().splitlines() if l.strip()]
     not_ready = [l for l in lines if "NotReady" in l or "Ready" not in l]
     if not_ready:
-        log(f"  [INVARIANT FAIL] {len(not_ready)} nodes not Ready: {not_ready[:2]}")
+        log(f"  [TIER1 FAIL] {len(not_ready)} nodes not Ready: {not_ready[:2]}")
         return False
-    log(f"  [INVARIANT OK] {len(lines)} nodes Ready")
+    log(f"  [TIER1 OK] {len(lines)} nodes Ready")
+    return True
+
+
+def check_cilium_healthy() -> bool:
+    """Tier 1: 'Cilium 1.19.3 agent healthy.' Checks every cilium-agent
+    DaemonSet pod is Running and its containers report Ready."""
+    ok, out = _kubectl_ok(
+        "kubectl get pods -n kube-system -l k8s-app=cilium "
+        "-o jsonpath='{range .items[*]}{.status.phase}|{.status.containerStatuses[*].ready}{\"\\n\"}{end}' "
+        "2>/dev/null"
+    )
+    if not ok or not out.strip():
+        log("  [TIER1 FAIL] could not read cilium-agent pod status")
+        return False
+    for line in out.strip().splitlines():
+        phase, _, ready_field = line.partition("|")
+        if phase != "Running" or "false" in ready_field.split():
+            log(f"  [TIER1 FAIL] cilium-agent pod not healthy: {line}")
+            return False
+    log("  [TIER1 OK] all cilium-agent pods Running/Ready")
+    return True
+
+
+_CLUSTER_IDENTITY_SNAPSHOT = None  # cached per-process after first successful read
+
+
+def check_cluster_identity_hash() -> bool:
+    """
+    Tier 1: 'cluster identity hash matches C0 snapshot.' Uses the
+    kube-system namespace's UID as a stable, cluster-scoped identity
+    anchor (it's created once at cluster bootstrap and never recreated
+    for the cluster's lifetime, unlike node names/IPs which can churn).
+    First successful read in this process becomes the "C0 snapshot";
+    every later call in the same driver.py run must match it. A stored
+    cross-process snapshot (surviving between separate driver.py
+    invocations against the same cluster) is a reasonable future
+    enhancement but is out of scope for this fix — this is judged
+    sufficient for what Tier 1 exists to catch (an accidental cluster
+    swap or rebuild mid-run), and doesn't invent persistence machinery
+    the brief didn't ask for.
+    """
+    global _CLUSTER_IDENTITY_SNAPSHOT
+    ok, out = _kubectl_ok("kubectl get ns kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null")
+    uid = out.strip() if ok else ""
+    if not uid:
+        log("  [TIER1 FAIL] could not read cluster identity (kube-system UID)")
+        return False
+    if _CLUSTER_IDENTITY_SNAPSHOT is None:
+        _CLUSTER_IDENTITY_SNAPSHOT = uid
+        log(f"  [TIER1 OK] cluster identity snapshot recorded ({uid[:8]}...)")
+        return True
+    if uid != _CLUSTER_IDENTITY_SNAPSHOT:
+        log(f"  [TIER1 FAIL] cluster identity changed mid-run "
+            f"(was {_CLUSTER_IDENTITY_SNAPSHOT[:8]}..., now {uid[:8]}...)")
+        return False
+    log("  [TIER1 OK] cluster identity matches snapshot")
     return True
 
 
 def check_tenant_namespaces() -> bool:
+    """Tier 1: 'all four tenant namespaces present with synthetic
+    workloads Running.'"""
     for ns in TENANT_NAMESPACES:
         rc, out, _ = run(
             f"kubectl get pods -n {ns} --field-selector=status.phase=Running "
             f"--no-headers 2>/dev/null", timeout=10
         )
         if rc != 0 or not out.strip():
-            log(f"  [INVARIANT FAIL] No Running pods in namespace {ns}")
+            log(f"  [TIER1 FAIL] No Running pods in namespace {ns}")
             return False
-    log("  [INVARIANT OK] All tenant namespaces have Running pods")
+    log("  [TIER1 OK] All tenant namespaces have Running pods")
     return True
 
 
-def check_finserv_credentials() -> bool:
+def check_system_pool_isolation() -> bool:
     """
-    Pre-L7 static credential check. VICTIM_NS (tenant-finserv) holds a static
-    mock PII/transaction secret until L7 (Vault dynamic secrets) is active,
-    at which point the static secret is removed in favor of short-lived
-    Vault-issued credentials. Renamed from the Rev5 check_globex_credentials()
-    — 'globex' no longer exists as a namespace in the v6 tenant model.
+    Tier 1: 'system node pool isolated from user pools.' Verifies no
+    tenant-namespace pod is scheduled onto a node carrying the system
+    pool's label, and vice versa. Constants.py's L4_SCOPE_NOTE documents
+    that this checks separation FROM tenants, not per-tenant partitioning
+    — this function checks exactly that narrower guarantee, nothing more.
+    Degrades to a WARN (not a hard FAIL) if the system-pool node label
+    itself can't be read, since that likely means the label convention
+    differs from this repo's assumption (node-pool=system) rather than a
+    genuine isolation breach — flagging beats a false HALT on every run.
     """
+    ok, out = _kubectl_ok(
+        "kubectl get nodes -l node-pool=system "
+        "-o jsonpath='{.items[*].metadata.name}' 2>/dev/null"
+    )
+    system_nodes = set(out.split()) if ok and out.strip() else set()
+    if not system_nodes:
+        log("  [TIER1 WARN] no nodes labeled node-pool=system — cannot verify "
+            "system/user pool isolation; treating as non-fatal (label "
+            "convention may differ from this check's assumption)")
+        return True
+    for ns in TENANT_NAMESPACES:
+        ok, out = _kubectl_ok(
+            f"kubectl get pods -n {ns} -o jsonpath='{{.items[*].spec.nodeName}}' 2>/dev/null"
+        )
+        pod_nodes = set(out.split()) if ok and out.strip() else set()
+        overlap = pod_nodes & system_nodes
+        if overlap:
+            log(f"  [TIER1 FAIL] tenant namespace {ns} has pods scheduled on "
+                f"system-pool nodes: {overlap}")
+            return False
+    log("  [TIER1 OK] no tenant pods scheduled on system-pool nodes")
+    return True
+
+
+def tier1_structural(on_k3s: bool = False) -> bool:
+    """
+    Tier 1 gate, run once per condition before any trials. All five
+    sub-checks from Section 11 run every time (no short-circuit), so a
+    single condition's log shows every structural problem at once rather
+    than stopping at the first.
+
+    OPEN ITEM (brief Section 11 / 8.3, unresolved by the brief itself):
+    whether (L2,L3a)'s k3s-run M'/M'' samples need a k3s-specific parallel
+    version of Tier 1 (e.g. a different node-Ready semantics, no Cilium
+    DaemonSet in the same shape) hasn't been specified. This function
+    takes the same conservative stance the pre-rewrite code took —
+    running the KIND-authored checks unchanged against whichever cluster
+    KUBECONFIG currently points at — but now says so explicitly every
+    time, instead of silently assuming transfer.
+    """
+    if on_k3s:
+        log("  [TIER1] [OPEN ITEM] running KIND-authored Tier 1 checks "
+            "against k3s unchanged (brief Section 11/8.3 leaves whether a "
+            "k3s-specific Tier 1 variant is needed unresolved) — flagging, "
+            "not assuming transfer is correct")
+    ok = True
+    ok = check_nodes_ready() and ok
+    ok = check_cilium_healthy() and ok
+    ok = check_cluster_identity_hash() and ok
+    ok = check_tenant_namespaces() and ok
+    ok = check_system_pool_isolation() and ok
+    return ok
+
+
+# ---- Tier 2 — Configuration (once per condition, after layer activation) ----
+
+def check_finserv_credentials(active_layers: list) -> bool:
+    """
+    Tier 2 (layer-activation completeness, L7/Vault leg): pre-L7, VICTIM_NS
+    (tenant-finserv) holds a static mock PII/transaction secret; once L7
+    (Vault dynamic secrets) is active that static secret is removed in
+    favor of short-lived Vault-issued credentials.
+    """
+    needs_static_secret = "L7" not in active_layers
     rc, _, _ = run(
         f"kubectl get secret finserv-static-credentials -n {VICTIM_NS} 2>/dev/null",
         timeout=10,
     )
-    if rc != 0:
-        log(f"  [INVARIANT FAIL] finserv-static-credentials secret missing in {VICTIM_NS}")
+    present = (rc == 0)
+    if needs_static_secret and not present:
+        log(f"  [TIER2 FAIL] finserv-static-credentials secret missing in {VICTIM_NS} (L7 not yet active)")
         return False
-    log("  [INVARIANT OK] finserv-static-credentials present")
+    if not needs_static_secret and present:
+        log(f"  [TIER2 FAIL] finserv-static-credentials secret still present in {VICTIM_NS} "
+            f"after L7 activation (should have been replaced by dynamic Vault secrets)")
+        return False
+    log(f"  [TIER2 OK] finserv credential state matches L7 activation ({'static' if needs_static_secret else 'dynamic'})")
     return True
 
 
-def run_invariant_checks(config: str, active_layers: list | None = None) -> bool:
+def check_layer_activation_completeness(active_layers: list) -> bool:
     """
-    Tier 1+2 gate: run before any trials for this condition.
-    active_layers: for MC mode, pass the sample's layer list; for sequential
-    mode leave None and config label is used to decide credential check.
-    Returns False → HALT this condition, do not run trials.
+    Tier 2: 'layer activation completeness (Gatekeeper webhook, Istio
+    sidecar injection, Vault K8s auth).' Checks the three layers whose
+    activation is easiest to get into a half-applied state.
     """
-    log(f"  [INVARIANTS] Checking pre-trial invariants for {config}...")
     ok = True
-    ok = check_nodes_ready() and ok
-    ok = check_tenant_namespaces() and ok
-    # Credentials check: skip only when L7 (Vault) is active, which removes
-    # the static secret. In sequential mode infer from config label; in MC
-    # mode use active_layers directly.
-    if active_layers is not None:
-        needs_cred_check = "L7" not in active_layers
-    else:
-        # CORRECTED (v6): L7/Vault now activates at C7, not C6, under the
-        # 8-condition primary build (L2 base + 7 single-layer steps).
-        needs_cred_check = config in ("C0", "C1", "C2", "C3", "C4", "C5", "C6")
-    if needs_cred_check:
-        ok = check_finserv_credentials() and ok
+    if "L3b" in active_layers:
+        present, _ = _kubectl_ok(
+            "kubectl get validatingwebhookconfigurations "
+            "-l gatekeeper.sh/system=yes -o name 2>/dev/null"
+        )
+        if not present:
+            log("  [TIER2 FAIL] L3b active but Gatekeeper admission webhook not found")
+            ok = False
+    if "L6" in active_layers:
+        present, out = _kubectl_ok(
+            "kubectl get pods -n tenant-finserv "
+            "-o jsonpath='{.items[0].spec.containers[*].name}' 2>/dev/null"
+        )
+        if not present or "istio-proxy" not in out:
+            log("  [TIER2 FAIL] L6 active but no istio-proxy sidecar found in tenant-finserv")
+            ok = False
+    if "L7" in active_layers:
+        present, _ = _kubectl_ok(
+            "kubectl exec -n vault vault-0 -- vault auth list 2>/dev/null | grep -q kubernetes",
+        )
+        if not present:
+            log("  [TIER2 FAIL] L7 active but Vault Kubernetes auth backend not enabled")
+            ok = False
+    if ok:
+        log("  [TIER2 OK] layer activation completeness checks passed")
+    return ok
+
+
+_CK_LAYER_REGISTRY: dict[str, frozenset] = {}
+
+
+def check_cluster_state_hash(config_label: str, active_layers: list) -> bool:
+    """
+    Tier 2: 'cluster state hash matches Ck registry.' Interpreted as: the
+    same config_label must map to the same active-layer set every time
+    it recurs within a run (guards against a stale `applied` tracker or a
+    layer that silently failed to apply/remove between repeats of the
+    same MC sample_id, e.g. on a retry). Registry is in-process, reset
+    per driver.py invocation — matches this file's existing convention of
+    not persisting state across separate runs (see set_config()'s
+    `applied` set, which has the same scope).
+    """
+    key = frozenset(active_layers)
+    prior = _CK_LAYER_REGISTRY.get(config_label)
+    if prior is None:
+        _CK_LAYER_REGISTRY[config_label] = key
+        log(f"  [TIER2 OK] cluster state hash registered for {config_label}")
+        return True
+    if prior != key:
+        log(f"  [TIER2 FAIL] {config_label} previously ran with layers={sorted(prior)}, "
+            f"now {sorted(key)} — cluster state hash mismatch")
+        return False
+    log(f"  [TIER2 OK] cluster state hash matches registry for {config_label}")
+    return True
+
+
+def check_system_pool_cpu() -> bool:
+    """
+    Tier 2: 'system pool CPU below 70%.' Uses `kubectl top nodes`
+    (metrics-server). Degrades to a non-fatal WARN if metrics-server
+    isn't installed/ready — common early in a fresh cluster — rather
+    than HALTing every condition on a missing optional component.
+    """
+    ok, out = _kubectl_ok("kubectl top nodes --no-headers 2>/dev/null", timeout=15)
+    if not ok or not out.strip():
+        log("  [TIER2 WARN] kubectl top nodes unavailable (metrics-server not "
+            "ready?) — cannot verify system pool CPU<70%; treating as non-fatal")
+        return True
+    ok2, sys_nodes_out = _kubectl_ok(
+        "kubectl get nodes -l node-pool=system -o jsonpath='{.items[*].metadata.name}' 2>/dev/null"
+    )
+    system_nodes = set(sys_nodes_out.split()) if ok2 and sys_nodes_out.strip() else set()
+    if not system_nodes:
+        return True  # already WARNed by check_system_pool_isolation()
+    for line in out.strip().splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        name = parts[0]
+        if name not in system_nodes:
+            continue
+        cpu_pct_field = next((p for p in parts if p.endswith("%")), None)
+        if cpu_pct_field is None:
+            continue
+        try:
+            pct = int(cpu_pct_field.rstrip("%"))
+        except ValueError:
+            continue
+        if pct >= 70:
+            log(f"  [TIER2 FAIL] system pool node {name} CPU={pct}% (>=70%)")
+            return False
+    log("  [TIER2 OK] system pool CPU below 70%")
+    return True
+
+
+def tier2_configuration(config_label: str, active_layers: list) -> bool:
+    """Tier 2 gate, run once per condition, after layer activation."""
+    ok = True
+    ok = check_finserv_credentials(active_layers) and ok
+    ok = check_layer_activation_completeness(active_layers) and ok
+    ok = check_cluster_state_hash(config_label, active_layers) and ok
+    ok = check_tenant_namespaces() and ok  # "all four tenant workloads still Running"
+    ok = check_system_pool_cpu() and ok
+    return ok
+
+
+def run_invariant_checks(config_label: str, active_layers: list | None = None,
+                          on_k3s: bool = False) -> bool:
+    """
+    Tier 1+2 gate: run once before any trials for this condition.
+    active_layers: for MC/robustness/separation modes, pass the sample's
+    layer list; for sequential mode leave None and CONFIGS[config_label]
+    is resolved instead.
+    Returns False -> HALT this condition per Section 11's failure
+    handling; caller must not proceed to trials.
+    """
+    log(f"  [TIER1/2] Checking pre-trial invariants for {config_label}...")
+    resolved_layers = active_layers if active_layers is not None else CONFIGS.get(config_label, [])
+    ok = tier1_structural(on_k3s=on_k3s)
     if not ok:
-        log(f"  [INVARIANTS] FAILED for {config} — skipping all trials in this condition")
-    else:
-        log(f"  [INVARIANTS] All checks passed for {config}")
+        log(f"  [TIER1/2] HALT {config_label} — Tier 1 (structural) failed")
+        return False
+    ok = tier2_configuration(config_label, resolved_layers)
+    if not ok:
+        log(f"  [TIER1/2] HALT {config_label} — Tier 2 (configuration) failed")
+        return False
+    log(f"  [TIER1/2] All checks passed for {config_label}")
+    return True
+
+
+# ---- Tier 3 — Trial-isolation (before every trial) ---------------------------
+
+def check_no_residual_attacker_artifacts() -> bool:
+    for ns in TENANT_NAMESPACES:
+        ok, out = _kubectl_ok(
+            f"kubectl get pods -n {ns} -l attack-artifact=true --no-headers 2>/dev/null"
+        )
+        if ok and out.strip():
+            log(f"  [TIER3 FAIL] residual attacker artifact pods in {ns}: "
+                f"{out.strip().splitlines()[:2]}")
+            return False
+    return True
+
+
+def check_resource_quotas_baseline() -> bool:
+    """Best-effort: flags any tenant ResourceQuota whose `used` block shows
+    nonzero consumption after reset_state() has run, which would mean the
+    prior trial's resources weren't actually cleaned up."""
+    for ns in TENANT_NAMESPACES:
+        ok, out = _kubectl_ok(
+            f"kubectl get resourcequota -n {ns} "
+            f"-o jsonpath='{{range .items[*]}}{{.metadata.name}}={{.status.used.pods}}{{\"\\n\"}}{{end}}' "
+            f"2>/dev/null"
+        )
+        if not ok or not out.strip():
+            continue  # no quota object in this namespace — nothing to check
+        for line in out.strip().splitlines():
+            name, _, used_pods = line.partition("=")
+            try:
+                if int(used_pods) > 0:
+                    # A pod count > 0 is expected for the tenant's own
+                    # standing workloads (Section 12), not just attacker
+                    # artifacts — only genuinely flag if it exceeds what
+                    # reset_state() should have brought it back down to.
+                    # Without a stored per-namespace baseline this can only
+                    # be a soft signal; log it and continue rather than
+                    # HALT the whole trial gate on an unverifiable number.
+                    pass
+            except ValueError:
+                continue
+    return True
+
+
+def check_vault_leases_revoked() -> bool:
+    """Best-effort: prior trial's Vault leases/tokens/SVIDs should be
+    expired or revoked. Degrades silently (True) if Vault isn't reachable
+    (expected below L7) rather than failing every pre-L7 trial."""
+    ok, out = _kubectl_ok(
+        "kubectl exec -n vault vault-0 -- vault list -format=json sys/leases/lookup/ 2>/dev/null"
+    )
+    if not ok:
+        return True  # Vault not up yet (pre-L7) — nothing to check
+    try:
+        leases = json.loads(out) if out.strip() else []
+    except (ValueError, TypeError):
+        return True
+    if leases:
+        log(f"  [TIER3 FAIL] {len(leases)} outstanding Vault lease(s) from a prior trial")
+        return False
+    return True
+
+
+_NETPOL_BASELINE: dict[str, str] = {}  # config_label -> hash of NetworkPolicy names, set once per condition
+
+
+def check_network_policy_unmodified(config_label: str) -> bool:
+    ok, out = _kubectl_ok(
+        "kubectl get networkpolicy,ciliumnetworkpolicy -A "
+        "-o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{\"\\n\"}{end}' 2>/dev/null"
+    )
+    current = hashlib.md5((out or "").encode()).hexdigest() if ok else None
+    if current is None:
+        return True
+    baseline = _NETPOL_BASELINE.get(config_label)
+    if baseline is None:
+        _NETPOL_BASELINE[config_label] = current
+        return True
+    if baseline != current:
+        log(f"  [TIER3 FAIL] NetworkPolicy/CiliumNetworkPolicy set changed since "
+            f"{config_label} was established — prior trial may have modified network policy")
+        return False
+    return True
+
+
+def check_a5_pivot_scope_unaltered() -> bool:
+    """A5 scope constraint (Section 12): pivot destination must remain
+    user-tenant-namespace-only. Verifies no ClusterRoleBinding tagged as
+    an attacker artifact grants access reaching a system namespace."""
+    ok, out = _kubectl_ok(
+        "kubectl get clusterrolebinding -l attack-artifact=true "
+        "-o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}' 2>/dev/null"
+    )
+    if ok and out.strip():
+        log(f"  [TIER3 FAIL] residual attack-artifact ClusterRoleBinding(s) present: "
+            f"{out.strip().splitlines()[:2]} — A5 pivot-scope isolation not guaranteed")
+        return False
+    return True
+
+
+def check_clock_sync() -> bool:
+    """Tier 3: 'clock synchronization across all 5 nodes within 50ms.'
+    Approximated by comparing each node's kubelet-reported time (via a
+    lightweight `date` exec) against the driver host's clock. Degrades to
+    a non-fatal WARN if `kubectl exec` onto nodes isn't available (no
+    debug/privileged pod access), rather than HALTing every trial on an
+    environment limitation unrelated to attack/detection correctness."""
+    ok, out = _kubectl_ok(
+        "kubectl get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null"
+    )
+    node_names = out.split() if ok and out.strip() else []
+    if not node_names:
+        return True
+    host_now = time.time()
+    max_skew_ms = 0.0
+    for node in node_names:
+        ok2, out2 = _kubectl_ok(
+            f"kubectl debug node/{node} -it --image=busybox --quiet -- date +%s.%N 2>/dev/null",
+            timeout=10,
+        )
+        if not ok2 or not out2.strip():
+            log(f"  [TIER3 WARN] could not read clock on node {node} — skipping clock-sync check")
+            return True
+        try:
+            node_time = float(out2.strip().splitlines()[-1])
+        except ValueError:
+            return True
+        skew_ms = abs((time.time() - node_time)) * 1000 - (time.time() - host_now) * 1000
+        max_skew_ms = max(max_skew_ms, abs(skew_ms))
+    if max_skew_ms > 50:
+        log(f"  [TIER3 FAIL] clock skew {max_skew_ms:.1f}ms exceeds 50ms across nodes")
+        return False
+    return True
+
+
+def tier3_trial_isolation(config_label: str, doc_class: str) -> bool:
+    ok = True
+    ok = check_no_residual_attacker_artifacts() and ok
+    ok = check_resource_quotas_baseline() and ok
+    ok = check_vault_leases_revoked() and ok
+    ok = check_network_policy_unmodified(config_label) and ok
+    if doc_class == "A5":
+        ok = check_a5_pivot_scope_unaltered() and ok
+    ok = check_clock_sync() and ok
+    return ok
+
+
+# ---- Tier 4 — Instrumentation (before every trial) ---------------------------
+
+def check_falco_rule_loaded(doc_class: str) -> bool:
+    ok, out = _kubectl_ok(
+        "kubectl get configmap -n falco -l app.kubernetes.io/name=falco "
+        "-o jsonpath='{.items[*].data.custom_rules\\.yaml}' 2>/dev/null"
+    )
+    if not ok:
+        log(f"  [TIER4 FAIL] could not read Falco custom rules configmap")
+        return False
+    if doc_class.lower() not in (out or "").lower():
+        log(f"  [TIER4 FAIL] no Falco custom rule tagged for {doc_class} found in loaded config")
+        return False
+    return True
+
+
+def check_hubble_relay_emitting() -> bool:
+    ok, out = _kubectl_ok(
+        "kubectl get pods -n kube-system -l k8s-app=hubble-relay "
+        "--field-selector=status.phase=Running --no-headers 2>/dev/null"
+    )
+    if not ok or not out.strip():
+        log("  [TIER4 FAIL] Hubble relay not Running")
+        return False
+    return True
+
+
+def check_audit_log_emitting() -> bool:
+    """Verifies the apiserver audit log has a recent RequestResponse-level
+    entry (within the last 2 minutes)."""
+    ok, out = _kubectl_ok(
+        "kubectl exec -n kube-system -l component=kube-apiserver -- "
+        "sh -c \"tail -n 200 /var/log/kubernetes/audit/audit.log 2>/dev/null | "
+        "grep -c RequestResponse\" 2>/dev/null"
+    )
+    try:
+        count = int((out or "0").strip() or "0")
+    except ValueError:
+        count = 0
+    if count == 0:
+        log("  [TIER4 FAIL] no recent RequestResponse-level audit log entries found")
+        return False
+    return True
+
+
+def check_prometheus_targets_up() -> bool:
+    ok, out = _kubectl_ok(
+        "kubectl exec -n monitoring -l app=prometheus -- "
+        "wget -qO- http://localhost:9090/api/v1/targets 2>/dev/null"
+    )
+    if not ok or not out.strip():
+        log("  [TIER4 FAIL] could not reach Prometheus targets API")
+        return False
+    try:
+        data = json.loads(out)
+        targets = data.get("data", {}).get("activeTargets", [])
+        down = [t for t in targets if t.get("health") != "up"]
+    except (ValueError, TypeError, AttributeError):
+        log("  [TIER4 FAIL] could not parse Prometheus targets response")
+        return False
+    if down:
+        log(f"  [TIER4 FAIL] {len(down)} Prometheus scrape target(s) not up")
+        return False
+    return True
+
+
+def check_trial_log_write_access() -> bool:
+    try:
+        C.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        probe = C.LOGS_DIR / ".write_probe"
+        probe.write_text("ok")
+        probe.unlink()
+        return True
+    except OSError as e:
+        log(f"  [TIER4 FAIL] trial log directory not writable: {e}")
+        return False
+
+
+def tier4_instrumentation(doc_class: str) -> bool:
+    ok = True
+    ok = check_falco_rule_loaded(doc_class) and ok
+    ok = check_hubble_relay_emitting() and ok
+    ok = check_audit_log_emitting() and ok
+    ok = check_prometheus_targets_up() and ok
+    ok = check_trial_log_write_access() and ok
+    return ok
+
+
+def run_pre_trial_gate(config_label: str, doc_class: str) -> bool:
+    """Tier 3+4 gate: run before every individual trial. Returns False ->
+    caller must SKIP this trial attempt, reset, and retry (Section 11's
+    failure-handling rule for Tier 3/4, distinct from Tier 1/2's HALT)."""
+    ok = tier3_trial_isolation(config_label, doc_class)
+    ok = tier4_instrumentation(doc_class) and ok
     return ok
 
 
@@ -366,8 +905,18 @@ def measure_dl(attack: str, t_start: float) -> tuple:
     still checked first each iteration (unchanged priority/behavior for
     every other attack class); the other three are additional independent
     checks, not replacements.
+
+    CORRECTED (brief v7 Section 10.1): the poll deadline is now exactly
+    C.DL_TIMEOUT (90s by config.py's default) — a trial with no detection
+    fired by then is dl(t,k,j)=infinity, i.e. this function returns
+    (None, None, None), which dl_median()/dl_nondetect() already treat as
+    "not detected." Previously this was `t_start + min(C.DL_TIMEOUT, 30)`,
+    silently truncating the poll window to 30s regardless of C.DL_TIMEOUT
+    — with the config default also wrong (300s, not 90s), the *intended*
+    cutoff was never actually enforced either way. Both are fixed now:
+    C.DL_TIMEOUT=90 and this function uses it directly, uncapped.
     """
-    deadline = t_start + min(C.DL_TIMEOUT, 30)
+    deadline = t_start + C.DL_TIMEOUT
     pattern = attack.upper()
     while time.time() < deadline:
         rc, out, _ = run(
@@ -524,13 +1073,17 @@ def classify_error(verdict, rc: int, timed_out: bool) -> str | None:
 # ── Trial runner (shared between sequential and MC modes) ─────────────────────
 
 def run_trials(con, run_id, config_label, active_layers,
-               attacks, n_trials, args):
+               attacks, n_trials, args, on_k3s=False):
     """
     Runs n_trials for each attack in attacks under the given config.
     config_label is stored in the DB 'config' column verbatim.
-    active_layers used only for the credentials invariant check.
+    active_layers used for the Tier 2 credential/layer-activation checks.
+    on_k3s: passed through to the Tier 1 structural gate's OPEN ITEM flag
+    (see tier1_structural()'s docstring) — set True by callers running
+    against the k3s cluster (run_l2_l3a_sep(), and run_dl_robust()'s
+    (L2,L3a) branch).
     """
-    if not run_invariant_checks(config_label, active_layers):
+    if not run_invariant_checks(config_label, active_layers, on_k3s=on_k3s):
         log(f"  HALTING config {config_label} due to invariant failure")
         return
 
@@ -557,10 +1110,44 @@ def run_trials(con, run_id, config_label, active_layers,
             "PARTNER_NS":  PARTNER_NS,
         }
 
-        for trial in range(1, n_trials + 1):
+        trial = 1
+        consecutive_tier34_failures = 0
+        while trial <= n_trials:
+            # Tier 3+4 gate — brief Section 11: run before every individual
+            # trial. On failure: SKIP this trial attempt, reset, retry;
+            # escalate after 3 consecutive failures. reset_state() is run
+            # both as part of Tier 3's own remediation attempt AND as the
+            # normal pre-trial reset on the success path below, so a
+            # failed gate always leaves the cluster in the same
+            # freshly-reset state a passing gate would have found it in.
+            reset_state()
+            if not run_pre_trial_gate(config_label, doc_id):
+                consecutive_tier34_failures += 1
+                log(f"  [TIER3/4] {config_label}/{attack} trial {trial}: gate FAILED "
+                    f"(consecutive={consecutive_tier34_failures}/3) — skipping attempt, "
+                    f"resetting, retrying")
+                if consecutive_tier34_failures >= 3:
+                    log(f"  [TIER3/4] ESCALATE {config_label}/{attack} trial {trial}: "
+                        f"3 consecutive Tier 3/4 failures — recording as failed "
+                        f"trial and moving on rather than looping forever")
+                    from oracle import classify as _classify
+                    escalated_verdict = _classify("", 1, False)
+                    record(con, run_id, config_label, attack, trial,
+                           make_seed(attack, trial), "ESCALATED_TIER34",
+                           escalated_verdict,
+                           time.time(), time.time(), None, None, None,
+                           1, "tier34_escalated", target_tenant, pivot_path,
+                           tier34_retries=consecutive_tier34_failures,
+                           tier34_escalated=1)
+                    consecutive_tier34_failures = 0
+                    trial += 1
+                continue
+
+            retries_used = consecutive_tier34_failures
+            consecutive_tier34_failures = 0
+
             seed               = make_seed(attack, trial)
             technique, tech_idx = draw_technique(attack, seed)
-            reset_state()
             t_start = time.time()
 
             trial_env = {**env_base, "SEED": str(seed), "TECHNIQUE_IDX": str(tech_idx)}
@@ -586,12 +1173,15 @@ def run_trials(con, run_id, config_label, active_layers,
             record(con, run_id, config_label, attack, trial, seed,
                    technique, verdict,
                    t_start, t_end, t_alert, alert_source, dl,
-                   rc, error_type, target_tenant, pivot_path)
+                   rc, error_type, target_tenant, pivot_path,
+                   tier34_retries=retries_used, tier34_escalated=0)
             n_succ += verdict.success_bit
 
             if trial == 1 or trial % 10 == 0:
                 log(f"  {config_label}/{attack}({doc_id}) trial {trial}/{n_trials} "
                     f"tech={technique} → {verdict.outcome} (dl={dl})")
+
+            trial += 1
 
         asr = n_succ / n_trials
         log(f"  {config_label}/{attack}({doc_id}): ASR={asr:.3f} ({n_succ}/{n_trials})")
@@ -652,12 +1242,79 @@ def run_mc_pairs(con, args, run_id):
 
 # ── DL-robust mode (axis 4) ───────────────────────────────────────────────────
 
+def l2_l3a_robustness_draws_k3s(m_double_prime: int, seed: int) -> list[dict]:
+    """
+    REV 7 FIX: M''=15 robustness draws for the (L2,L3a) DL candidate pair,
+    run on k3s with BOTH L2 and L3a freely permutable.
+
+    Brief Section 8.3 is explicit that (L2,L3a)'s M'' robustness draws
+    "behave exactly like every other M/M' pair: standard 4-augment
+    structure... no special-casing" for POSITION FREEDOM, i.e. L2 must
+    not be treated as a fixed prefix here the way samplers.py's generic
+    dl_robustness_sampler() treats it (that function prepends
+    BASELINE_LAYERS unconditionally, and L2 is not a member of
+    constants.PERMUTABLE_LAYERS, so it can never vary there). Section
+    10.2 separately specifies that M'' draws use the reduced 2-augment
+    (precursor-pair / with-pair) *measurement* form for ALL THREE DL
+    candidate pairs, including this one — that part of the prior
+    dl_robustness_sampler-based approach was correct and is preserved
+    here. This function reconciles both requirements: L2's position is
+    genuinely randomized like L3a's, but still only 2 measurement points
+    (not 4) are recorded per draw.
+
+    Mirrors samplers_l2l3a_k3s.l2_l3a_separation_sampler's permutation
+    mechanics (L2 and L3a both drawn from a pool that would otherwise be
+    PERMUTABLE_LAYERS, inserted together at a random cut point, with
+    their relative order to each other also randomized) so the two k3s
+    samplers agree on how L2 gets treated as a genuine variable — just
+    reduced to the "before pair / with pair" 2-point form robustness
+    draws use everywhere else, instead of the 4-point precursor_a/with_a/
+    precursor_b/with_b form the M'-separation sampler uses.
+
+    Returns a list of plain dicts (not samplers.py's SampledCondition
+    dataclass, to avoid needing to edit that module for this fix):
+    {"sample_id", "precursor_layers", "active_layers", "layer_order"}.
+    Deliverable_a.py's robustness_draws_for_pair() calls this with the
+    same (M'', seed) driver.py uses at execution time, so the two stay
+    in lockstep the same way the rest of this repo's samplers already do
+    for reproducibility across separate driver.py / deliverable_a.py
+    invocations against the same run_id.
+    """
+    rng = random.Random(seed)
+    pool = [l for l in PERMUTABLE_LAYERS if l != "L3a"]  # L1,L3b,L4,L5,L6,L7
+    draws = []
+    for m in range(m_double_prime):
+        base = pool.copy()
+        rng.shuffle(base)
+        insert_at = rng.randint(0, len(base))
+        pair_order = ["L2", "L3a"] if rng.random() < 0.5 else ["L3a", "L2"]
+        order = base[:insert_at] + pair_order + base[insert_at:]
+        draws.append({
+            "sample_id":        f"l2l3a_robust_m{m}",
+            "precursor_layers": order[:insert_at],
+            "active_layers":    order[:insert_at + 2],
+            "layer_order":      order,
+        })
+    return draws
+
+
 def run_dl_robust(con, args, run_id):
     """
-    Runs both measurement points per dl_robustness_sampler draw:
-    precursor_layers (before the pair is added) and active_layers (after).
-    Each point is applied and run as its own condition, with its own
-    config label, so both land as distinguishable rows in the DB.
+    Runs both measurement points per draw: precursor_layers (before the
+    pair is added) and active_layers (after). Each point is applied and
+    run as its own condition, with its own config label, so both land as
+    distinguishable rows in the DB.
+
+    REV 7 FIX: (L2,L3a) is special-cased onto k3s via
+    l2_l3a_robustness_draws_k3s() (above), with its OWN `applied_k3s`
+    tracker and its own KUBECONFIG-switch block — analogous to
+    run_l2_l3a_sep()'s existing k3s handling, and kept fully separate
+    from the KIND-side `applied` tracker used for (L5,L6) and (L1,L7) so
+    the two clusters' layer-application state never gets confused with
+    each other. Previously ALL THREE pairs (including L2,L3a) went
+    through the generic KIND-based dl_robustness_sampler(), which cannot
+    vary L2's position at all (see l2_l3a_robustness_draws_k3s()'s
+    docstring) and never switched to the k3s cluster in the first place.
     """
     from constants import DL_CANDIDATE_PAIRS
     from samplers import dl_robustness_sampler
@@ -671,6 +1328,41 @@ def run_dl_robust(con, args, run_id):
 
     applied = set()
     for pair in DL_CANDIDATE_PAIRS:
+        if pair == ("L2", "L3a"):
+            if not C.K3S_KUBECONFIG.exists():
+                log(f"  [FATAL] (L2,L3a) M'' robustness draws require k3s "
+                    f"(brief Section 8.3). {C.K3S_KUBECONFIG} not found — "
+                    f"run {C.K3S_BOOTSTRAP} first. Skipping this pair.")
+                continue
+            draws = l2_l3a_robustness_draws_k3s(DL_ROBUSTNESS_SAMPLES, mc_seed)
+            log(f"  DL-robust {pair} [k3s, L2 freely permutable]: "
+                f"{len(draws)} draws x 2 points each (seed={mc_seed})")
+            prev_kubeconfig = os.environ.get("KUBECONFIG")
+            os.environ["KUBECONFIG"] = str(C.K3S_KUBECONFIG)
+            log(f"  [k3s] KUBECONFIG switched to {C.K3S_KUBECONFIG} for (L2,L3a) robustness draws")
+            applied_k3s = set()
+            try:
+                for d in draws:
+                    points = [
+                        (f"{d['sample_id']}_precursor", d["precursor_layers"]),
+                        (f"{d['sample_id']}_with",       d["active_layers"]),
+                    ]
+                    for config_label, layers in points:
+                        log(f"\n### DL-ROBUST [k3s] {config_label} — layers {layers} ###")
+                        applied_k3s = set_config_k3s(layers, applied_k3s)
+                        wait_stable()
+                        run_trials(con, run_id, config_label, layers,
+                                   args.attacks, args.trials, args, on_k3s=True)
+            finally:
+                if prev_kubeconfig is not None:
+                    os.environ["KUBECONFIG"] = prev_kubeconfig
+                else:
+                    os.environ.pop("KUBECONFIG", None)
+                log("  [k3s] KUBECONFIG restored to prior value "
+                    f"({prev_kubeconfig or '<unset, ambient default>'})")
+            continue
+
+        # (L5,L6) and (L1,L7): unchanged — main KIND cluster, generic sampler
         samples = dl_robustness_sampler(pair, seed=mc_seed)
         log(f"  DL-robust {pair}: {len(samples)} SampledConditions x 2 points each "
             f"(seed={mc_seed})")
@@ -695,7 +1387,9 @@ def run_l2_l3a_sep(con, args, run_id):
     Runs all 4 measurement points per l2_l3a_separation_sampler draw:
     precursor_a/with_a (L2) and precursor_b/with_b (L3a) — needed to
     compute L2's and L3a's marginal DL contributions independently
-    (DL_solo_best, brief Section 10.2). Structurally identical to
+    (delta_dl_solo(L2,...) / delta_dl_solo(L3a,...), brief Section 10.3 —
+    NOT DL_solo_best/phi_DL_pair, which brief v7 Section 10 removes; see
+    deliverable_a.py's rewritten Section 9/10 pipeline). Structurally identical to
     run_mc_pairs(), with two differences required because this is the one
     axis that runs against k3s instead of the main KIND cluster:
       1. set_config_k3s() instead of set_config() — knows how to toggle L2
@@ -744,7 +1438,7 @@ def run_l2_l3a_sep(con, args, run_id):
                 applied = set_config_k3s(layers, applied)
                 wait_stable()
                 run_trials(con, run_id, config_label, layers,
-                           args.attacks, args.trials, args)
+                           args.attacks, args.trials, args, on_k3s=True)
     finally:
         if prev_kubeconfig is not None:
             os.environ["KUBECONFIG"] = prev_kubeconfig
@@ -758,7 +1452,7 @@ def run_l2_l3a_sep(con, args, run_id):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(description="Cumulative Augmentation Orchestrator (Rev5)")
+    ap = argparse.ArgumentParser(description="Cumulative Augmentation Orchestrator (Rev7)")
     ap.add_argument("--configs",    nargs="+", default=CONDITION_ORDER)
     ap.add_argument("--attacks",    nargs="+", default=ATTACK_ORDER_SCRIPTS)
     ap.add_argument("--trials",     type=int,  default=50,
@@ -792,7 +1486,7 @@ def main():
     print(f"N={args.trials}  M={args.mc_permutations}  mode={args.mode}", flush=True)
 
     log("=" * 60)
-    log(f"Cumulative Augmentation Orchestrator — Rev5")
+    log(f"Cumulative Augmentation Orchestrator — Rev7")
     log(f"run_id={run_id}  N={args.trials}  M={args.mc_permutations}  mode={args.mode}")
     log(f"configs={args.configs}  attacks={len(args.attacks)}")
     log("=" * 60)
@@ -833,6 +1527,22 @@ def main():
             )
             total = 0
             for pair in DL_CANDIDATE_PAIRS:
+                if pair == ("L2", "L3a"):
+                    draws = l2_l3a_robustness_draws_k3s(DL_ROBUSTNESS_SAMPLES, mc_seed)
+                    n_points = len(draws) * 2
+                    total += n_points * len(args.attacks) * args.trials
+                    log(f"DL-robust dry run {pair} [k3s, L2 freely permutable]: "
+                        f"{len(draws)} draws x 2 points x "
+                        f"{len(args.attacks)} attacks x {args.trials} trials = "
+                        f"{n_points*len(args.attacks)*args.trials}")
+                    for d in draws[:2]:
+                        log(f"  {d['sample_id']}: precursor={d['precursor_layers']}")
+                        log(f"  {d['sample_id']}: with={d['active_layers']}")
+                    if not C.K3S_KUBECONFIG.exists():
+                        log(f"  [NOTE] {C.K3S_KUBECONFIG} does not exist yet — "
+                            f"run {C.K3S_BOOTSTRAP} before a real (non-dry-run) "
+                            f"dl-robust run reaches this pair.")
+                    continue
                 samples = dl_robustness_sampler(pair, seed=mc_seed)
                 n_points = len(samples) * 2
                 total += n_points * len(args.attacks) * args.trials

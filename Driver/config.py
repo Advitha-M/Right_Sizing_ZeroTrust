@@ -7,8 +7,18 @@ C.apply_script()/C.remove_script(), C.ATTACKS_DIR, C.CLEANUP_DIR,
 C.DL_TIMEOUT, C.ATTACK_TIMEOUT, C.BASE_SEED — without this module driver.py
 fails on import before anything else in the pipeline can run. Written to
 match the actual repo layout (Attacks/, Controls/c1-l1..c7-vault, Driver/,
-harness/) and harness/config.env's defaults (N_TRIALS=50, BASE_SEED=42,
-DL_TIMEOUT=300, ATTACK_TIMEOUT=90).
+harness/).
+
+CORRECTED (brief v7 Section 10.1): DL_TIMEOUT was 300s, disagreeing with
+the brief's fixed, uniform 90-second non-detection cutoff
+("dl(t,k,j) = infinity if no alert fires within 90 seconds of trial
+start... a fixed 90-second wall-clock cutoff, uniform across all 7 attack
+classes -- not class-specific and not tied to each trial's own execution
+time"). harness/Harness/config.env still defaults to DL_TIMEOUT=300 and
+was NOT part of this rewrite's requested scope (config.py, driver.py,
+deliverable_a.py only) -- update it to 90 too before relying on it for a
+real run; a bare `python3 Driver/driver.py` invocation is unaffected
+since it reads this module's default, not that file's.
 
 Values NOT hardcoded elsewhere in constants.py live here on purpose —
 constants.py is explicit that it holds shared *vocabulary* (conditions,
@@ -96,5 +106,11 @@ def remove_script_k3s(layer_id: str) -> Path:
 import os
 
 BASE_SEED      = int(os.environ.get("BASE_SEED", 42))
-DL_TIMEOUT     = int(os.environ.get("DL_TIMEOUT", 300))
+# Brief v7 Section 10.1: "dl(t,k,j) = infinity if no alert fires within 90
+# seconds of trial start... fixed... uniform across all 7 attack classes."
+# CORRECTED from 300 -- 300 both disagreed with the brief's fixed value
+# and (via driver.measure_dl()'s deadline calc) was being silently
+# overridden down to an undocumented 30s anyway. Now the single source of
+# truth for the poll deadline; see measure_dl()'s docstring in driver.py.
+DL_TIMEOUT     = int(os.environ.get("DL_TIMEOUT", 90))
 ATTACK_TIMEOUT = int(os.environ.get("ATTACK_TIMEOUT", 90))

@@ -51,6 +51,14 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${HERE}/../.." && pwd)"
 K3S_CONFIG_DIR="${K3S_CONFIG_DIR:-/etc/rancher/k3s}"
+
+# ADDED (validation pass): dependency preflight — checks kubectl/helm/
+# python3+scipy+numpy, installs whichever is missing, and restarts this
+# script once so freshly-installed tools are picked up cleanly. docker/kind
+# checks are skipped for this path (k3s runs directly on the host, no KIND/
+# docker involved) — see Infra/preflight.sh's header.
+source "${HERE}/../preflight.sh" k3s "$0" "$@"
+
 TENANTS=(tenant-lowpriv tenant-finserv tenant-partner tenant-saas)
 
 banner(){ echo; echo "=============================================="; echo "$1"; echo "=============================================="; }

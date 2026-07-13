@@ -1,0 +1,16 @@
+# Right-Sizing Zero Trust — Python dependencies
+#
+# ADDED (validation pass): previously no requirements.txt/setup.py/
+# pyproject.toml existed anywhere in this repo, despite Driver/deliverable_a.py
+# importing scipy and numpy directly (Wilcoxon signed-rank test, rank-biserial
+# effect size, Section 10.6's superadditivity test). Infra/preflight.sh
+# installs these automatically if missing; this file exists for anyone
+# setting up the environment manually instead, and to make the dependency
+# explicit rather than implicit.
+#
+# Everything else Driver/*.py imports (argparse, base64, hashlib, json, math,
+# os, random, re, sqlite3, subprocess, sys, time, dataclasses, datetime,
+# itertools, pathlib, typing) is Python 3 standard library — no further
+# entries needed.
+scipy>=1.10
+numpy>=1.24

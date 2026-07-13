@@ -25,11 +25,20 @@ name: zt-lab
 # install it explicitly as part of infra/setup.sh's phase1 (added — see that
 # file), pinned to the version the Tier-1 invariant check expects:
 #   helm install cilium cilium/cilium --version 1.19.3 --namespace kube-system
+#
+# CORRECTED (validation pass): the control-plane node previously carried no
+# label at all, while Driver/driver.py's check_system_pool_isolation() (and
+# Tenants/burst_load.sh's CPU-cap watchdog) both select the system node via
+# `-l node-pool=system`. With no node ever matching, both silently hit their
+# "no nodes labeled..." fallback and passed/degraded unconditionally instead
+# of checking anything. The control-plane node below is now labeled
+# `node-pool: system` so those checks have something real to find.
 # -----------------------------------------------------------------------------
 networking:
   disableDefaultCNI: true
 nodes:
   - role: control-plane
+    labels: { node-pool: system }
     kubeadmConfigPatches:
       - |
         kind: ClusterConfiguration

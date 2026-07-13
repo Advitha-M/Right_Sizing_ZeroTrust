@@ -26,7 +26,7 @@
 # =============================================================================
 set -euo pipefail
 
-ATTACKER_NS="${ATTACKER_NS:-tenant-lowpriv}"
+ATTACKER_NS="${ATTACKER_NS:-tenant-partner}"
 VICTIM_NS="${VICTIM_NS:-tenant-finserv}"
 SEED="${SEED:-$$}"
 

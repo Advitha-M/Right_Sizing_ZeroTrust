@@ -50,6 +50,15 @@ set -o pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
+# ADDED (validation pass): dependency preflight — checks docker/kind/kubectl/
+# helm/python3+scipy+numpy, installs whichever is missing, and restarts this
+# script once so freshly-installed tools are picked up cleanly. Previously
+# none of this was checked; every phase below just assumed these all already
+# worked. See Infra/preflight.sh's header for exactly what it can and can't
+# self-heal (it cannot fix missing internet access or undersized hardware —
+# those are reported as a hard-fail / warning respectively, not restarted).
+source "${REPO_ROOT}/Infra/preflight.sh" kind "$0" "$@"
+
 TENANTS=(tenant-lowpriv tenant-finserv tenant-partner tenant-saas)
 CILIUM_VERSION="1.19.3"
 
@@ -179,11 +188,19 @@ phase3(){
 }
 
 # ----------------------------------------------------------------------------
-# PHASE 4 : attack tooling — Stratus (optional) + Attacks/*.sh executable
-#           (flat directory: attackN.sh, wrap.sh, oracle.sh, stratus_adapter.sh)
+# PHASE 4 : attack tooling — Attacks/attackN.sh executable
+#
+# CORRECTED (validation pass): this phase previously also installed
+# Stratus Red Team and expected Attacks/wrap.sh, Attacks/oracle.sh, and
+# Attacks/stratus_adapter.sh. All three were confirmed dead: driver.py
+# invokes `bash {attackN.sh}` directly and classifies output with
+# Driver/oracle.py (the Python module), never through any shell wrapper —
+# they were leftover from an earlier wrapper architecture that driver.py
+# superseded. Deleted; this phase now only handles the attackN.sh scripts
+# that are actually used.
 # ----------------------------------------------------------------------------
 phase4(){
-  banner "PHASE 4 : attack tooling (Stratus optional)"
+  banner "PHASE 4 : attack tooling"
 
   step "Marking Attacks/*.sh and controls/*/apply.sh + remove.sh executable"
   chmod +x "${REPO_ROOT}"/Attacks/*.sh \
@@ -191,20 +208,7 @@ phase4(){
            "${REPO_ROOT}"/Controls/*/remove.sh \
            "${REPO_ROOT}"/Harness/*.sh 2>/dev/null || true
 
-  step "Installing Stratus Red Team (optional — Attacks/stratus_adapter.sh degrades to native if absent)"
-  URL=$(curl -s https://api.github.com/repos/DataDog/stratus-red-team/releases/latest \
-        | grep "browser_download_url" | grep -iE "linux.*(amd64|x86_64)\.tar\.gz" | head -1 | cut -d '"' -f 4)
-  if [ -n "$URL" ]; then
-    curl -fsSL -o /tmp/stratus.tar.gz "$URL"
-    tar xzf /tmp/stratus.tar.gz -C /tmp stratus 2>/dev/null
-    sudo install -m 0755 /tmp/stratus /usr/local/bin/stratus 2>/dev/null \
-      && echo "       stratus installed ($(stratus version 2>/dev/null | head -1))" \
-      || echo "       (warn) stratus install needs sudo — install manually; Attacks/stratus_adapter.sh falls back to native"
-  else
-    echo "       (warn) couldn't resolve Stratus download — stratus_adapter.sh falls back to native attacks"
-  fi
-
-  echo "  PHASE 4 done. (Native attacks committed; Stratus optional via USE_STRATUS=1.)"
+  echo "  PHASE 4 done. (Native attacks committed; no external tooling required.)"
 }
 
 # ----------------------------------------------------------------------------
@@ -396,12 +400,9 @@ verify(){
     && ok "results.db exists (created by driver.py)" \
     || nfo "results.db not created yet — normal until the first driver.py/harness run"
 
-  echo "----- Phase 4 : attacks + wrappers -----"
-  command -v stratus >/dev/null 2>&1 && ok "Stratus installed (optional)" || nfo "Stratus absent — Attacks/stratus_adapter.sh falls back to native (OK)"
+  echo "----- Phase 4 : attacks -----"
   C=$(ls "${REPO_ROOT}"/Attacks/attack*.sh 2>/dev/null | wc -l)
   [ "$C" -eq 7 ] && ok "7 attack scripts present" || bad "expected 7 attacks, got $C"
-  [ -f "${REPO_ROOT}/Attacks/wrap.sh" ] && ok "wrapper present" || bad "Attacks/wrap.sh missing"
-  [ -f "${REPO_ROOT}/Attacks/oracle.sh" ] && ok "oracle (shell) present" || bad "Attacks/oracle.sh missing"
   [ -f "${REPO_ROOT}/Driver/oracle.py" ] && ok "oracle (python) present" || bad "Driver/oracle.py missing"
   [ -f "${REPO_ROOT}/Driver/config.py" ] \
     && ok "Driver/config.py present" \

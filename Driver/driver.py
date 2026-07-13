@@ -79,7 +79,7 @@ import config as C
 from constants import (
     CONFIGS, CONDITION_ORDER, ATTACK_ORDER_SCRIPTS, ATTACK_CLASSES,
     ATTACKER_NS_MAP, SCRIPT_TO_DOC, TECHNIQUE_SETS, VICTIM_NS, PARTNER_NS,
-    TENANTS, PERMUTABLE_LAYERS, DL_ROBUSTNESS_SAMPLES,
+    TENANTS, PERMUTABLE_LAYERS, DL_ROBUSTNESS_SAMPLES, CILIUM_VERSION,
 )
 
 # Canonical tenant namespace list — derived from constants.TENANTS, the v6
@@ -271,7 +271,15 @@ def check_nodes_ready() -> bool:
 
 def check_cilium_healthy() -> bool:
     """Tier 1: 'Cilium 1.19.3 agent healthy.' Checks every cilium-agent
-    DaemonSet pod is Running and its containers report Ready."""
+    DaemonSet pod is Running and its containers report Ready, AND that the
+    running agent's image tag matches constants.CILIUM_VERSION.
+
+    CORRECTED (validation pass): this previously only checked Running/Ready
+    status — a version drift (e.g. someone re-installing a different Cilium
+    chart version onto an already-provisioned cluster) would pass silently.
+    The invariant's own name is "Cilium 1.19.3 agent healthy", not just
+    "Cilium agent healthy", so the version is part of what's being asserted.
+    """
     ok, out = _kubectl_ok(
         "kubectl get pods -n kube-system -l k8s-app=cilium "
         "-o jsonpath='{range .items[*]}{.status.phase}|{.status.containerStatuses[*].ready}{\"\\n\"}{end}' "
@@ -285,7 +293,24 @@ def check_cilium_healthy() -> bool:
         if phase != "Running" or "false" in ready_field.split():
             log(f"  [TIER1 FAIL] cilium-agent pod not healthy: {line}")
             return False
-    log("  [TIER1 OK] all cilium-agent pods Running/Ready")
+
+    ver_ok, ver_out = _kubectl_ok(
+        "kubectl get pods -n kube-system -l k8s-app=cilium "
+        "-o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null"
+    )
+    if not ver_ok or not ver_out.strip():
+        log("  [TIER1 FAIL] cilium-agent pods healthy but could not read agent image "
+            f"to verify pinned version {CILIUM_VERSION}")
+        return False
+    image = ver_out.strip()
+    m = re.search(r"[:@]v?(\d+\.\d+\.\d+)", image)
+    running_ver = m.group(1) if m else None
+    if running_ver != CILIUM_VERSION:
+        log(f"  [TIER1 FAIL] cilium-agent version drift: expected {CILIUM_VERSION}, "
+            f"found {running_ver or 'unparseable'} (image={image})")
+        return False
+
+    log(f"  [TIER1 OK] all cilium-agent pods Running/Ready at pinned version {CILIUM_VERSION}")
     return True
 
 

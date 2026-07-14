@@ -12,10 +12,14 @@
 #  naming (see Harness/config.env's explicit note on this).
 #
 #  Usage:
-#     sudo -v                 # cache your password ONCE
-#     ./infra/setup.sh all    # run everything (default)
+#     ./infra/setup.sh all    # run everything (default) — no manual pre-steps
 #     ./infra/setup.sh verify # check every phase + baseline (all 7 SUCCEED @ C0)
 #     ./infra/setup.sh phase1|phase2|phase3|phase4|phase5
+#
+#  sudo: invoked automatically wherever it's actually needed (Infra/
+#  preflight.sh's installs, this script's own `all)` dispatch) — you do not
+#  need to pre-run `sudo -v` yourself; if credentials aren't cached, sudo
+#  will just prompt interactively at that point.
 #
 #  KEY DIFFERENCES vs the pre-v6 generator's setup.sh:
 #   * Phase 1 is NEW. There is no Makefile in this repo (the old header

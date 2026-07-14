@@ -41,8 +41,10 @@
 #  compatibility gap.
 #
 #  Usage:
-#     sudo -v                     # cache your password ONCE
-#     Infra/k3s/bootstrap.sh       # idempotent, safe to re-run
+#     Infra/k3s/bootstrap.sh       # idempotent, safe to re-run — no manual
+#                                  # pre-steps; sudo is invoked automatically
+#                                  # wherever it's actually needed and will
+#                                  # prompt interactively if not cached
 #
 #  Env overrides: K3S_CONFIG_DIR (default /etc/rancher/k3s), matches
 #  Controls/c-l2-audit/apply.sh's default.

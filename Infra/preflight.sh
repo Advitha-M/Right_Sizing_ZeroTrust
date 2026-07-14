@@ -130,20 +130,58 @@ _pf_check_docker() {
     _pf_log "  OK: docker present and responding"
     return 0
   fi
+
   if command -v docker >/dev/null 2>&1; then
-    _pf_warn "docker binary present but 'docker info' failed (daemon down or " \
-             "permission denied) — trying to start the daemon..."
+    local err
+    err="$(docker info 2>&1 >/dev/null || true)"
+
+    if echo "$err" | grep -qi "permission denied"; then
+      # This user just isn't in the docker group (yet, or the group was
+      # granted in a previous run but this session predates it). Fixable
+      # without any manual log-out/login: (re-)add to the group and restart
+      # this script through `sg docker` so the new membership is active in
+      # the very next process, not just after a fresh login.
+      _pf_log "  'docker info' failed with permission denied — adding " \
+              "\$USER to the docker group and restarting through it " \
+              "(no manual log-out/login needed)"
+      _pf_sudo usermod -aG docker "$USER" || \
+        _pf_fail "tried to fix docker permissions with 'usermod -aG docker " \
+                 "$USER' but it failed — this needs root and neither sudo " \
+                 "nor running-as-root was available"
+      _PF_DOCKER_FRESH=true   # reuses the sg-docker restart path below
+      _PF_NEEDS_RESTART=true
+      return 0
+    fi
+
+    _pf_warn "docker binary present but 'docker info' failed (daemon appears " \
+             "to be down) — trying to start it..."
     _pf_sudo systemctl start docker 2>/dev/null || true
     sleep 2
     if docker info >/dev/null 2>&1; then
       _pf_log "  OK: docker daemon started"
       return 0
     fi
-    _pf_fail "docker is installed but not usable (daemon won't start, or this " \
-             "user isn't in the docker group and passwordless sudo isn't " \
-             "available) — fix manually (e.g. 'sudo usermod -aG docker \$USER' " \
-             "then log out/in) and re-run."
+
+    _pf_warn "daemon still not responding after a start attempt — trying a " \
+             "reinstall (get.docker.com is idempotent/safe to re-run) before " \
+             "giving up..."
+    curl -fsSL https://get.docker.com -o /tmp/get-docker.sh && \
+      sh /tmp/get-docker.sh && \
+      _pf_sudo systemctl enable --now docker 2>/dev/null
+    sleep 2
+    if docker info >/dev/null 2>&1; then
+      _pf_log "  OK: docker working after reinstall"
+      return 0
+    fi
+
+    _pf_fail "docker is installed but its daemon won't come up even after a " \
+             "start attempt and a reinstall attempt — this looks like a real " \
+             "host problem (out of disk, kernel/cgroup mismatch, conflicting " \
+             "runtime, etc.) rather than something safe to keep guessing at " \
+             "automatically. Check 'sudo journalctl -u docker' for the actual " \
+             "daemon error and re-run."
   fi
+
   _pf_log "  docker not found — installing via get.docker.com..."
   curl -fsSL https://get.docker.com -o /tmp/get-docker.sh || \
     _pf_fail "could not download the docker install script from get.docker.com"
@@ -179,6 +217,39 @@ _pf_check_kind() {
   _pf_log "  kind installed"
 }
 
+# All 5 nodes (1 control-plane + 4 workers, brief Section 11's "5-node KIND
+# cluster") report Ready — used both after creation and to decide whether a
+# pre-existing cluster is actually usable or silently broken.
+_pf_kind_cluster_ready() {
+  local kubeconfig_flag=(--context kind-zt-lab)
+  local ready_count
+  ready_count=$(kubectl "${kubeconfig_flag[@]}" get nodes --no-headers 2>/dev/null \
+    | awk '$2=="Ready"' | wc -l)
+  [[ "${ready_count:-0}" -ge 5 ]]
+}
+
+# Wraps `kind create cluster` with one self-healing retry: if creation fails
+# (e.g. a stale docker network/container left over from a previous aborted
+# run), delete whatever partial state exists and retry once before giving
+# up — rather than failing and expecting a human to run `kind delete
+# cluster` by hand before re-running.
+_pf_create_kind_cluster_with_retry() {
+  local cfg="$1"
+  if kind create cluster --config "$cfg" --wait 3m; then
+    return 0
+  fi
+  _pf_warn "kind create cluster failed on the first attempt — cleaning up any " \
+           "partial state and retrying once (no manual 'kind delete cluster' " \
+           "needed)"
+  kind delete cluster --name zt-lab 2>/dev/null || true
+  docker rm -f zt-lab-control-plane zt-lab-worker zt-lab-worker2 \
+    zt-lab-worker3 zt-lab-worker4 >/dev/null 2>&1 || true
+  kind create cluster --config "$cfg" --wait 3m || \
+    _pf_fail "kind create cluster failed twice in a row (see output above) — " \
+             "this usually means docker itself is unhealthy or out of " \
+             "resources, not something a retry can paper over."
+}
+
 _pf_ensure_kind_cluster() {
   [[ "$_PF_SUBSTRATE" != "kind" ]] && return 0
   # Runs after kind is confirmed present (either already there, or about to
@@ -186,21 +257,37 @@ _pf_ensure_kind_cluster() {
   # since we're restarting anyway and this check will run again post-restart
   # with a real `kind` binary on PATH).
   command -v kind >/dev/null 2>&1 || return 0
+
+  # Locate kind-cluster.yaml by search rather than a hardcoded folder name —
+  # previously hardcoded to Infra/files(1)/, which would silently break (and
+  # require a manual code edit) the moment that folder is renamed. `find`
+  # makes this survive a rename with zero code changes, which matters here
+  # specifically because "no manual intervention at any stage" has to include
+  # "no manual intervention after routine repo housekeeping" too.
+  local cfg
+  cfg="$(find "$_PF_INFRA_DIR" -maxdepth 2 -name "kind-cluster.yaml" -print -quit 2>/dev/null)"
+  [[ -n "$cfg" && -f "$cfg" ]] || \
+    _pf_fail "could not find kind-cluster.yaml anywhere under ${_PF_INFRA_DIR} " \
+             "(searched 2 levels deep) — it may have been moved or deleted."
+
   _pf_log "checking for the 'zt-lab' KIND cluster..."
   if kind get clusters 2>/dev/null | grep -qx "zt-lab"; then
-    _pf_log "  OK: zt-lab cluster already exists"
-    return 0
+    if _pf_kind_cluster_ready; then
+      _pf_log "  OK: zt-lab cluster already exists and all nodes are Ready"
+      return 0
+    fi
+    _pf_warn "zt-lab cluster exists but isn't fully Ready — deleting and " \
+             "recreating rather than leaving a broken cluster for someone to " \
+             "diagnose by hand"
+    kind delete cluster --name zt-lab 2>/dev/null || true
   fi
-  _pf_log "  zt-lab cluster not found — creating it now " \
-          "(kind create cluster --config Infra/files(1)/kind-cluster.yaml). " \
-          "This previously had to be done manually; no script ever ran it."
-  local cfg="${_PF_INFRA_DIR}/files(1)/kind-cluster.yaml"
-  [[ -f "$cfg" ]] || _pf_fail "expected KIND config at ${cfg} but it's not there — " \
-                              "if you've renamed Infra/files(1), update this path " \
-                              "in Infra/preflight.sh's _pf_ensure_kind_cluster()."
-  kind create cluster --config "$cfg" || \
-    _pf_fail "kind create cluster failed — see output above"
-  _pf_log "  zt-lab cluster created"
+
+  _pf_log "  creating zt-lab cluster (kind create cluster --config ${cfg})..."
+  _pf_create_kind_cluster_with_retry "$cfg"
+  _pf_kind_cluster_ready || \
+    _pf_fail "zt-lab cluster was created but nodes never reached Ready — " \
+             "check 'kubectl get nodes' / 'docker ps' for what's stuck."
+  _pf_log "  zt-lab cluster created and all nodes Ready"
 }
 
 _pf_check_kubectl() {

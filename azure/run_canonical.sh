@@ -31,7 +31,17 @@
 # (NUM_WORKERS can also be set permanently via the systemd unit's
 # Environment= line instead of passing it ad hoc.)
 # =============================================================================
-set -uo pipefail
+# FIX: was `set -uo pipefail` (no -e). Combined with no `&&`/exit-code
+# check between merge_results.py and the self-deallocate call below, a
+# FAILED merge (corrupt/partial worker DB, disk full, schema mismatch from
+# a racing ALTER TABLE) was silently swallowed and the script proceeded to
+# deallocate the VM anyway — losing the only automatic chance to retry the
+# merge, with nothing left running to notice or alert. `-e` now stops the
+# script on any unchecked failing command; the merge step below is also
+# explicitly gated on its own exit code as defense in depth, since relying
+# on bare `-e` for a step this consequential is easy to accidentally defeat
+# later (e.g. by piping it through `tee`).
+set -euo pipefail
 cd /opt/rszt
 
 NUM_WORKERS="${NUM_WORKERS:-4}"
@@ -108,7 +118,28 @@ fi
 echo "[run_canonical] COMPLETE — merging ${NUM_WORKERS} per-worker DBs into results/results.db"
 rm -f /opt/rszt/results/results.db   # idempotency: merge_results.py refuses to overwrite
 WORKER_DBS=(/opt/rszt/results/canon-*/results.db)
-python3 azure/merge_results.py "${WORKER_DBS[@]}" --out /opt/rszt/results/results.db
+
+# Defense in depth beyond bare `-e`: if the glob above matched nothing (all
+# workers somehow produced no results.db), bash leaves WORKER_DBS holding
+# the literal unexpanded pattern rather than an empty array — fail with a
+# clear message here instead of an opaque "file not found" from python.
+if [[ ! -e "${WORKER_DBS[0]}" ]]; then
+  echo "[run_canonical] FATAL: no per-worker results.db files found matching" \
+       "/opt/rszt/results/canon-*/results.db — NOT deallocating. Check" \
+       "each worker's log under /opt/rszt/logs for why its DB is missing." >&2
+  exit 1
+fi
+
+# FIX: explicitly gated, not just relying on top-of-file `-e`. If the merge
+# fails (corrupt/partial worker DB, disk full, a schema mismatch), the VM
+# must stay up so systemd can retry rather than deallocating with no
+# results.db ever having been produced.
+if ! python3 azure/merge_results.py "${WORKER_DBS[@]}" --out /opt/rszt/results/results.db; then
+  echo "[run_canonical] FATAL: merge_results.py failed — NOT deallocating," \
+       "leaving VM up for systemd to retry. Per-worker DBs are untouched under" \
+       "/opt/rszt/results/canon-*/results.db if you need to merge by hand." >&2
+  exit 1
+fi
 
 echo "[run_canonical] authenticating with VM managed identity to self-deallocate"
 az login --identity >/dev/null

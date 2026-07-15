@@ -31,7 +31,10 @@
 # One-time setup (see azure/install_service.sh):
 #   sudo NUM_WORKERS=3 azure/install_service.sh rszt-shapley
 # =============================================================================
-set -uo pipefail
+# FIX: was `set -uo pipefail` (no -e) — see run_canonical.sh's header
+# comment for the failure mode this closes (a failed merge previously
+# didn't stop the self-deallocate call below it).
+set -euo pipefail
 cd /opt/rszt
 
 NUM_WORKERS="${NUM_WORKERS:-3}"
@@ -72,7 +75,13 @@ worker() {
 
     echo "[worker $i] bootstrapping k3s instance ${K3S_SERVICE} (idempotent)"
     Infra/k3s/bootstrap.sh
-  } 2>&1 | tee -a "$logdir/setup.log"
+  # FIX: `|| true` here is required now that -e is on. Without it, a
+  # failing pipeline would terminate this function immediately, skipping
+  # the setup_rc check/log line right below and the graceful `return
+  # "$setup_rc"` — losing exactly the diagnostic message an unattended
+  # multi-day run depends on someone being able to read after the fact.
+  # PIPESTATUS is still captured correctly on the next line either way.
+  } 2>&1 | tee -a "$logdir/setup.log" || true
   local setup_rc=${PIPESTATUS[0]}
   if [[ "$setup_rc" -ne 0 ]]; then
     echo "[worker $i] cluster setup failed rc=$setup_rc" | tee -a "$logdir/setup.log"
@@ -87,9 +96,12 @@ worker() {
       return 0
     fi
     echo "[worker $i] === mode: $mode (shard $i/$NUM_WORKERS) ==="
+    # FIX: same `|| true` reasoning as the setup pipeline above — without
+    # it, -e would skip the rc echo and the sentinel-file write on the
+    # very next lines whenever a mode fails.
     python3 Driver/driver.py --mode "$mode" --run-id "$RUN_ID" \
       --shard-index "$i" --shard-count "$NUM_WORKERS" \
-      2>&1 | tee -a "$logdir/${mode//-/_}.log"
+      2>&1 | tee -a "$logdir/${mode//-/_}.log" || true
     local rc=${PIPESTATUS[0]}
     echo "[worker $i] mode=$mode rc=$rc"
     [[ "$rc" -eq 0 ]] && date > "$sentinel"
@@ -125,7 +137,25 @@ fi
 echo "[run_shapley] COMPLETE — merging ${NUM_WORKERS} per-worker DBs into results/results.db"
 rm -f /opt/rszt/results/results.db
 WORKER_DBS=(/opt/rszt/results/shap-*/results.db)
-python3 azure/merge_results.py "${WORKER_DBS[@]}" --out /opt/rszt/results/results.db
+
+if [[ ! -e "${WORKER_DBS[0]}" ]]; then
+  echo "[run_shapley] FATAL: no per-worker results.db files found matching" \
+       "/opt/rszt/results/shap-*/results.db — NOT deallocating. Check each" \
+       "worker's log under /opt/rszt/logs/shap-*/ for why its DB is missing." >&2
+  exit 1
+fi
+
+# FIX: same reasoning as run_canonical.sh — a failed merge must keep the
+# VM up (doubly true here: this is the Spot VM, see provision_shapley.sh's
+# eviction-recovery notes — you do NOT want an evictable VM to also
+# deallocate ITSELF right after finishing real work, with no results to
+# show for it, on top of whatever eviction risk it already carries).
+if ! python3 azure/merge_results.py "${WORKER_DBS[@]}" --out /opt/rszt/results/results.db; then
+  echo "[run_shapley] FATAL: merge_results.py failed — NOT deallocating, leaving" \
+       "VM up for systemd to retry. Per-worker DBs are untouched under" \
+       "/opt/rszt/results/shap-*/results.db if you need to merge by hand." >&2
+  exit 1
+fi
 
 echo "[run_shapley] authenticating with VM managed identity to self-deallocate"
 az login --identity >/dev/null

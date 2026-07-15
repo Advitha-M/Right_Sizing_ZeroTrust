@@ -397,11 +397,59 @@ _pf_log "=== preflight: substrate=${_PF_SUBSTRATE} restart_count=${ZT_PREFLIGHT_
 _pf_check_internet
 _pf_check_resources     # warn-only, never sets _PF_NEEDS_RESTART
 
+# ---------------------------------------------------------------------------
+# FIX (multi-worker race): run_canonical.sh/run_shapley.sh launch 2-4
+# `worker()` processes in parallel on ONE VM, and each one sources this file
+# via `Infra/KIND/setup.sh all` before it has any KIND cluster of its own.
+# On a freshly provisioned VM every worker hits "docker/kind/kubectl/helm/
+# python3 not found" at the same instant and would previously run
+# concurrent `apt-get install`, concurrent `curl get.docker.com | sh`, and
+# concurrent installs to the same /usr/local/bin/{kind,kubectl,helm} paths
+# with zero coordination — a near-guaranteed dpkg-lock/partial-binary race
+# on exactly the first, unattended boot of a multi-day run.
+#
+# Fixed with a flock-guarded critical section around ONLY the shared
+# host-level installs. What's NOT in this section: _pf_ensure_kind_cluster
+# (each worker creates its own uniquely-named KIND cluster — safe/desired
+# to run concurrently) and everything setup.sh does afterward (Cilium/
+# Falco/Prometheus/Istio/Gatekeeper/Vault/SPIRE — all installed via `helm`
+# against each worker's OWN $KUBECONFIG-selected cluster, no shared state).
+# Only the "is this binary on PATH system-wide yet" checks need to be
+# serialized; per-cluster work stays fully parallel.
+#
+# Lock file lives in /tmp by default (always writable, survives for the
+# life of the VM's uptime, which is all we need — it does not need to
+# survive a reboot). Override via ZT_PREFLIGHT_LOCK if /tmp is unusable
+# for some reason. A 900s (15min) wait cap avoids a genuinely wedged
+# worker (e.g. one that died mid-`apt-get` while holding the lock) hanging
+# every other worker forever; on timeout this hard-fails with a message
+# pointing at what to check, rather than looping silently.
+# ---------------------------------------------------------------------------
+_PF_LOCK_FILE="${ZT_PREFLIGHT_LOCK:-/tmp/.zt_preflight_install.lock}"
+_pf_log "acquiring shared install lock (${_PF_LOCK_FILE}) — serializes the" \
+        "docker/kind/kubectl/helm/python installs below across any other" \
+        "worker on this same VM doing the same checks concurrently"
+exec {_PF_LOCK_FD}>"${_PF_LOCK_FILE}" || \
+  _pf_fail "could not open ${_PF_LOCK_FILE} for the shared install lock"
+if ! flock -w 900 "${_PF_LOCK_FD}"; then
+  _pf_fail "timed out after 900s waiting for the shared install lock" \
+           "(${_PF_LOCK_FILE}) — another worker's dependency install may be" \
+           "stuck. Check that worker's log under /opt/rszt/logs, and/or" \
+           "'ps aux | grep -E \"apt-get|get-docker|get-helm\"' on this VM." \
+           "If the holder is confirmed dead (not just slow), remove" \
+           "${_PF_LOCK_FILE} and re-run."
+fi
+_pf_log "  lock acquired"
+
 _pf_check_docker
 _pf_check_kind
 _pf_check_kubectl
 _pf_check_helm
 _pf_check_python
+
+flock -u "${_PF_LOCK_FD}"
+exec {_PF_LOCK_FD}>&-
+_pf_log "shared install lock released"
 
 if $_PF_NEEDS_RESTART; then
   if [[ "${ZT_PREFLIGHT_RESTARTS:-0}" -ge 1 ]]; then

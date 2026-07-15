@@ -1,0 +1,24 @@
+[Unit]
+Description=Right-Sizing Zero Trust — Shapley correction (mc-pairs, dl-robust, l2-l3a-sep)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ztadmin
+WorkingDirectory=/opt/rszt
+# Each worker runs its own KIND cluster AND its own native k3s instance
+# concurrently — heavier per-worker than the canonical VM, so this
+# defaults lower. Tune to the VM's CPU/RAM. Edit here or via
+# `systemctl edit rszt-shapley.service` rather than exporting it ad hoc.
+Environment=NUM_WORKERS=3
+ExecStart=/opt/rszt/azure/run_shapley.sh
+# Same reasoning as rszt-canonical.service — see that file's comments.
+# Restart=on-failure + StartLimitIntervalSec=0 means an interrupted mode
+# resumes in place rather than requiring anyone to notice and intervene.
+Restart=on-failure
+RestartSec=120
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

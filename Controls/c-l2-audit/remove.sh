@@ -34,6 +34,7 @@ set -uo pipefail
 K3S_CONFIG_DIR="${K3S_CONFIG_DIR:-/etc/rancher/k3s}"
 K3S_CONFIG_YAML="${K3S_CONFIG_DIR}/config.yaml"
 AUDIT_POLICY_DST="${K3S_CONFIG_DIR}/c-l2-audit-policy.yaml"
+K3S_SERVICE="${K3S_SERVICE:-k3s}"
 
 echo "[c-l2-audit] [1/3] removing audit flags from ${K3S_CONFIG_YAML}"
 if sudo test -f "${K3S_CONFIG_YAML}" && sudo grep -q "audit-policy-file=" "${K3S_CONFIG_YAML}" 2>/dev/null; then
@@ -69,8 +70,8 @@ echo "[c-l2-audit] [2/3] removing copied audit policy ${AUDIT_POLICY_DST}"
 sudo rm -f "${AUDIT_POLICY_DST}"
 echo "  removed (or was not present)"
 
-echo "[c-l2-audit] [3/3] restarting k3s and waiting for apiserver"
-sudo systemctl restart k3s
+echo "[c-l2-audit] [3/3] restarting ${K3S_SERVICE} and waiting for apiserver"
+sudo systemctl restart "${K3S_SERVICE}"
 for i in $(seq 1 30); do
   kubectl get --raw='/healthz' >/dev/null 2>&1 && break
   sleep 2

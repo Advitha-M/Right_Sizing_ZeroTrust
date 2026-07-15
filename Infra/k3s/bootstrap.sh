@@ -52,7 +52,27 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${HERE}/../.." && pwd)"
-K3S_CONFIG_DIR="${K3S_CONFIG_DIR:-/etc/rancher/k3s}"
+
+# K3S_INSTANCE (env, default "1") — lets parallel workers on one VM each run
+# their own independent native k3s server instead of every worker fighting
+# over the single systemd "k3s" service this script used to hardcode.
+# k3s's own install script supports this via INSTALL_K3S_NAME (systemd unit
+# becomes k3s-<name>.service); combined with --data-dir, --https-listen-port,
+# and --config below, each instance is fully isolated on one host — no
+# shared state with any other instance.
+#
+# NOT YET VALIDATED against a live install in this environment (no network
+# egress to get.k3s.io from where this was written) — the INSTALL_K3S_NAME/
+# --config/--write-kubeconfig flag behavior below is per k3s's documented
+# install-script env vars, but confirm against `k3s --help` / the installed
+# systemd unit on your actual VM before trusting a multi-instance run
+# unattended for days.
+K3S_INSTANCE="${K3S_INSTANCE:-1}"
+K3S_SERVICE="k3s-${K3S_INSTANCE}"
+K3S_HTTPS_PORT="${K3S_HTTPS_PORT:-$((6443 + K3S_INSTANCE))}"
+K3S_DATA_DIR="/var/lib/rancher/${K3S_SERVICE}"
+K3S_CONFIG_DIR="${K3S_CONFIG_DIR:-/etc/rancher/${K3S_SERVICE}}"
+K3S_KUBECONFIG_OUT="${K3S_CONFIG_DIR}/k3s.yaml"
 
 # ADDED (validation pass): dependency preflight — checks kubectl/helm/
 # python3+scipy+numpy, installs whichever is missing, and restarts this
@@ -68,26 +88,36 @@ step(){ echo "-> $1"; }
 
 banner "Infra/k3s/bootstrap.sh — (L2,L3a) separation sampler cluster"
 
-step "Installing k3s (single node; Traefik + ServiceLB disabled — not used here)"
-if ! command -v k3s >/dev/null 2>&1; then
-  curl -sfL https://get.k3s.io | \
-    INSTALL_K3S_EXEC="server --disable traefik --disable servicelb" sh -
+step "Installing k3s instance '${K3S_SERVICE}' (systemd unit ${K3S_SERVICE}.service; " \
+     "port ${K3S_HTTPS_PORT}; Traefik + ServiceLB disabled — not used here)"
+if systemctl list-unit-files 2>/dev/null | grep -q "^${K3S_SERVICE}\.service"; then
+  echo "   ${K3S_SERVICE} already installed — skipping install (idempotent)"
 else
-  echo "   k3s already installed — skipping install (idempotent)"
+  sudo mkdir -p "${K3S_CONFIG_DIR}"
+  curl -sfL https://get.k3s.io | \
+    INSTALL_K3S_NAME="${K3S_SERVICE}" \
+    INSTALL_K3S_EXEC="server --disable traefik --disable servicelb \
+      --data-dir ${K3S_DATA_DIR} \
+      --https-listen-port ${K3S_HTTPS_PORT} \
+      --config ${K3S_CONFIG_DIR}/config.yaml \
+      --write-kubeconfig ${K3S_KUBECONFIG_OUT} \
+      --write-kubeconfig-mode 644" \
+    sh -
 fi
 
-step "Waiting for k3s apiserver"
-sudo mkdir -p "${K3S_CONFIG_DIR}"
+step "Waiting for k3s apiserver (instance ${K3S_SERVICE})"
 for i in $(seq 1 30); do
-  sudo test -f /etc/rancher/k3s/k3s.yaml && break
+  sudo test -f "${K3S_KUBECONFIG_OUT}" && break
   sleep 2
 done
 
-step "Copying kubeconfig to ${HERE}/k3s.yaml (Driver/config.py's K3S_KUBECONFIG)"
-sudo cp /etc/rancher/k3s/k3s.yaml "${HERE}/k3s.yaml"
-sudo chmod 644 "${HERE}/k3s.yaml"
-# Single-node install — server URL (127.0.0.1) is already correct, no rewrite needed.
-export KUBECONFIG="${HERE}/k3s.yaml"
+step "Copying kubeconfig to ${HERE}/k3s-${K3S_INSTANCE}.yaml (point ZT_K3S_KUBECONFIG at this)"
+sudo cp "${K3S_KUBECONFIG_OUT}" "${HERE}/k3s-${K3S_INSTANCE}.yaml"
+sudo chmod 644 "${HERE}/k3s-${K3S_INSTANCE}.yaml"
+# --write-kubeconfig already resolves the server URL against --https-listen-port
+# above, so (unlike the old single-instance version of this script) no
+# server-URL rewrite is needed here either.
+export KUBECONFIG="${HERE}/k3s-${K3S_INSTANCE}.yaml"
 for i in $(seq 1 30); do
   kubectl get --raw='/healthz' >/dev/null 2>&1 && break
   sleep 2
@@ -227,9 +257,10 @@ kubectl -n dex rollout status deployment/dex --timeout=90s \
 # matching nodes and log a (warn), not fail — Part 3 (Dex/OIDC) is
 # unaffected and still applies normally on a single node.
 
-banner "bootstrap.sh done"
-echo "KUBECONFIG for this cluster: ${HERE}/k3s.yaml (= Driver/config.py's K3S_KUBECONFIG)"
-echo "L2 (audit logging) is OFF by default — Controls/c-l2-audit/apply.sh turns it on;"
+banner "bootstrap.sh done (instance ${K3S_SERVICE})"
+echo "KUBECONFIG for this instance: ${HERE}/k3s-${K3S_INSTANCE}.yaml"
+echo "Point Driver/config.py at it via: export ZT_K3S_KUBECONFIG=${HERE}/k3s-${K3S_INSTANCE}.yaml"
+echo "L2 (audit logging) is OFF by default — Controls/c-l2-audit/apply.sh turns it on"
+echo "(pass K3S_SERVICE=${K3S_SERVICE} K3S_CONFIG_DIR=${K3S_CONFIG_DIR} so it targets this instance);"
 echo "Driver/driver.py --mode l2-l3a-sep toggles it automatically per draw."
-echo "Next: python3 Driver/driver.py --mode l2-l3a-sep --dry-run   (sanity check)"
-echo "Then: python3 Driver/driver.py --mode l2-l3a-sep --trials 50"
+echo "Next: ZT_K3S_KUBECONFIG=${HERE}/k3s-${K3S_INSTANCE}.yaml python3 Driver/driver.py --mode l2-l3a-sep --dry-run"

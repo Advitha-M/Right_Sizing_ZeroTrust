@@ -207,6 +207,44 @@ def record(con, run_id, config, attack, trial, seed, technique_token,
 # Trial t of attack j gets the same seed regardless of condition,
 # making technique draws identical across conditions — required for McNemar.
 
+def shard(samples: list, args) -> list:
+    """
+    Splits a sampler's draw list across N parallel workers on the same
+    substrate. `--shard-index i` (0-based) of `--shard-count n` workers
+    each takes every n-th draw (samples[i::n]) — deterministic given the
+    same seed, so every worker computes the SAME full sample list and just
+    keeps a disjoint slice of it; no coordination between workers needed
+    and every draw is covered exactly once across the fleet.
+    No-op (returns samples unchanged) if --shard-count is unset or 1.
+    """
+    if not getattr(args, "shard_count", None) or args.shard_count <= 1:
+        return samples
+    if not (0 <= args.shard_index < args.shard_count):
+        sys.exit(f"--shard-index must be in [0, {args.shard_count}) — got {args.shard_index}")
+    sharded = samples[args.shard_index::args.shard_count]
+    log(f"  [SHARD] {len(samples)} draws -> {len(sharded)} for shard "
+        f"{args.shard_index}/{args.shard_count}")
+    return sharded
+
+
+def count_existing_trials(con, run_id, config, attack) -> tuple:
+    """
+    How many trial rows already exist for this exact (run_id, config,
+    attack), and how many of those were successes. Trial indices are
+    inserted 1..n_trials with no gaps (every while-loop iteration in
+    run_trials() either records a real trial or an ESCALATED_TIER34 row
+    before incrementing `trial`, and record() commits immediately after
+    a single INSERT — no partial/uncommitted rows possible), so the count
+    IS the next trial index to resume from.
+    """
+    row = con.execute(
+        "SELECT COUNT(*), COALESCE(SUM(success),0) FROM trials "
+        "WHERE run_id=? AND config=? AND attack=?",
+        (run_id, config, attack),
+    ).fetchone()
+    return (row[0], row[1]) if row else (0, 0)
+
+
 def make_seed(attack: str, trial: int) -> int:
     h = hashlib.md5(f"{attack}{trial}".encode()).hexdigest()
     return C.BASE_SEED + (int(h[:8], 16) % 100000)
@@ -901,6 +939,158 @@ def set_config_k3s(target_layers, applied):
     return applied
 
 
+# ── Real-cluster-state detection (resumability fix) ─────────────────────────
+#
+# set_config()/set_config_k3s() only ever remove a layer if it's in the
+# in-memory `applied` set. Every call-site used to seed that set as an
+# assumed-empty `set()`, which is only true for a genuinely fresh cluster —
+# after a crash-restart on the same VM, or a fresh process on a new VM
+# pointed at a cluster/disk that survived, `applied` would silently forget
+# about whatever was really still running, and set_config() would then
+# never issue the remove.sh calls needed to tear it down. This probes the
+# live cluster for each layer's own idempotency marker (the same marker
+# each apply.sh checks before re-applying, or that each remove.sh clears)
+# so `applied` reflects reality, not process memory, on every startup.
+#
+# One probe per layer, matched to the marker its own apply.sh/remove.sh
+# pair already uses for idempotency — see Controls/<dir>/apply.sh's
+# corresponding step for provenance of each check below.
+
+def detect_applied_layers() -> set:
+    """Seed `applied` from the live KIND cluster's real state."""
+    applied = set()
+
+    # L1 (c1-l1): Part 1 (etcd encryption) is applied first and removed
+    # last in that script, so its presence/absence brackets all four parts.
+    # Container name follows kind's own "<cluster-name>-control-plane"
+    # convention — CLUSTER_NAME lets parallel workers each target their
+    # own KIND cluster instead of the single hardcoded "zt-lab".
+    cp_container = f"{os.environ.get('CLUSTER_NAME', 'zt-lab')}-control-plane"
+    rc, _out, _ = run(
+        f'docker exec {cp_container} grep -q "encryption-provider-config" '
+        '/etc/kubernetes/manifests/kube-apiserver.yaml',
+        timeout=15,
+    )
+    if rc == 0:
+        applied.add("L1")
+
+    # L3a (c2-rbac): per-tenant "tenant-self-read" Role only exists while applied.
+    rc, _out, _ = run("kubectl get role tenant-self-read -n tenant-lowpriv", timeout=15)
+    if rc == 0:
+        applied.add("L3a")
+
+    # L3b (c3-opa): its own Constraint kind, not the shared Gatekeeper engine
+    # (L1 can also install the Gatekeeper controller — that's not an L3b signal).
+    rc, out, _ = run("kubectl get k8sdenyprivileged -A --no-headers", timeout=15)
+    if rc == 0 and out.strip():
+        applied.add("L3b")
+
+    # L4 (c4-tenant-isolation): its labeled ResourceQuota.
+    rc, out, _ = run(
+        "kubectl get resourcequota -A -l zt-control=c4-tenant-isolation --no-headers",
+        timeout=15,
+    )
+    if rc == 0 and out.strip():
+        applied.add("L4")
+
+    # L5 (c5-networkpolicy): its labeled NetworkPolicy.
+    rc, out, _ = run(
+        "kubectl get networkpolicy -A -l zt-control=c5-networkpolicy --no-headers",
+        timeout=15,
+    )
+    if rc == 0 and out.strip():
+        applied.add("L5")
+
+    # L6 (c6-istio): its labeled PeerAuthentication (STRICT mTLS).
+    rc, out, _ = run(
+        "kubectl get peerauthentication -A -l zt-control=c6-istio --no-headers",
+        timeout=15,
+    )
+    if rc == 0 and out.strip():
+        applied.add("L6")
+
+    # L7 (c7-vault): the secret-mode annotation apply.sh writes / remove.sh clears.
+    rc, out, _ = run(
+        "kubectl get namespace tenant-finserv -o "
+        "jsonpath='{.metadata.annotations.zt-lab/secret-mode}'",
+        timeout=15,
+    )
+    if rc == 0 and out.strip():
+        applied.add("L7")
+
+    if applied:
+        log(f"  [RESUME] KIND cluster already has layers active: {sorted(applied)}")
+    else:
+        log("  [RESUME] KIND cluster has no layers active (clean baseline)")
+    return applied
+
+
+def detect_applied_layers_k3s() -> set:
+    """Seed `applied` from the live k3s cluster's real state (K3S_LAYERS pool)."""
+    k3s_env = {"KUBECONFIG": str(C.K3S_KUBECONFIG)}
+    applied = set()
+
+    # L2 (c-l2-audit): audit flags in k3s's own config.yaml on the k3s host.
+    # (This probe runs on the k3s host's filesystem, not via kubectl.)
+    rc, _out, _ = run(
+        'sudo grep -q "audit-policy-file=" /etc/rancher/k3s/config.yaml', timeout=15
+    )
+    if rc == 0:
+        applied.add("L2")
+
+    # L1 on k3s: c1-l1/apply.sh's Part 1 (etcd encryption) targets a hardcoded
+    # KIND control-plane container name and does not apply to a k3s host, so
+    # it is not a usable marker here — pre-existing scope limit of c1-l1,
+    # not introduced by this fix. Use the digest-pin Constraint instead
+    # (kubectl-based, so it works against whichever cluster KUBECONFIG points at).
+    rc, out, _ = run("kubectl get k8srequiredigestpin -A --no-headers", timeout=15, env=k3s_env)
+    if rc == 0 and out.strip():
+        applied.add("L1")
+
+    rc, _out, _ = run("kubectl get role tenant-self-read -n tenant-lowpriv", timeout=15, env=k3s_env)
+    if rc == 0:
+        applied.add("L3a")
+
+    rc, out, _ = run("kubectl get k8sdenyprivileged -A --no-headers", timeout=15, env=k3s_env)
+    if rc == 0 and out.strip():
+        applied.add("L3b")
+
+    rc, out, _ = run(
+        "kubectl get resourcequota -A -l zt-control=c4-tenant-isolation --no-headers",
+        timeout=15, env=k3s_env,
+    )
+    if rc == 0 and out.strip():
+        applied.add("L4")
+
+    rc, out, _ = run(
+        "kubectl get networkpolicy -A -l zt-control=c5-networkpolicy --no-headers",
+        timeout=15, env=k3s_env,
+    )
+    if rc == 0 and out.strip():
+        applied.add("L5")
+
+    rc, out, _ = run(
+        "kubectl get peerauthentication -A -l zt-control=c6-istio --no-headers",
+        timeout=15, env=k3s_env,
+    )
+    if rc == 0 and out.strip():
+        applied.add("L6")
+
+    rc, out, _ = run(
+        "kubectl get namespace tenant-finserv -o "
+        "jsonpath='{.metadata.annotations.zt-lab/secret-mode}'",
+        timeout=15, env=k3s_env,
+    )
+    if rc == 0 and out.strip():
+        applied.add("L7")
+
+    if applied:
+        log(f"  [RESUME] k3s cluster already has layers active: {sorted(applied)}")
+    else:
+        log("  [RESUME] k3s cluster has no layers active (clean baseline)")
+    return applied
+
+
 def reset_state():
     script = C.CLEANUP_DIR / "reset_trial.sh"
     if script.exists():
@@ -1120,7 +1310,27 @@ def run_trials(con, run_id, config_label, active_layers,
 
         doc_id  = SCRIPT_TO_DOC[attack]
         atk_ns  = ATTACKER_NS_MAP[doc_id]
-        n_succ  = 0
+
+        # RESUME FIX: a crash/restart used to always start this attack's
+        # trial loop at 1, re-running (and duplicating rows for) whatever
+        # had already completed before the interruption — harmless for a
+        # short run, but for a multi-day unattended run under systemd
+        # auto-restart this would silently inflate N for early configs
+        # every time a later config crashed, corrupting the significance
+        # gate's sample sizes, and waste real compute re-doing finished
+        # work. Trial indices are inserted with no gaps (see
+        # count_existing_trials()'s docstring), so resuming from the
+        # existing count is exact, not an approximation.
+        already, already_succ = count_existing_trials(con, run_id, config_label, attack)
+        n_succ  = already_succ
+        if already >= n_trials:
+            log(f"  {config_label}/{attack}({doc_id}): {already}/{n_trials} trials "
+                f"already recorded for run_id={run_id} — skipping (resume)")
+            continue
+        if already > 0:
+            log(f"  {config_label}/{attack}({doc_id}): resuming at trial "
+                f"{already + 1}/{n_trials} ({already} already recorded for "
+                f"run_id={run_id})")
 
         # target_tenant: the namespace being attacked. VICTIM_NS for all
         # classes; A3 uses PARTNER_NS as attacker but VICTIM_NS as target.
@@ -1135,7 +1345,7 @@ def run_trials(con, run_id, config_label, active_layers,
             "PARTNER_NS":  PARTNER_NS,
         }
 
-        trial = 1
+        trial = already + 1
         consecutive_tier34_failures = 0
         while trial <= n_trials:
             # Tier 3+4 gate — brief Section 11: run before every individual
@@ -1215,7 +1425,7 @@ def run_trials(con, run_id, config_label, active_layers,
 # ── Sequential mode ───────────────────────────────────────────────────────────
 
 def run_sequential(con, args, run_id):
-    applied = set()
+    applied = detect_applied_layers()
     for cfg in args.configs:
         if cfg not in CONFIGS:
             log(f"skip unknown config {cfg}")
@@ -1243,10 +1453,11 @@ def run_mc_pairs(con, args, run_id):
         int(hashlib.md5(run_id.encode()).hexdigest()[:8], 16)
     )
     samples = shapley_pair_sampler(M=args.mc_permutations, seed=mc_seed)
+    samples = shard(samples, args)
     log(f"  MC-pairs: {len(samples)} SampledConditions x 4 points each "
         f"(M={args.mc_permutations}, seed={mc_seed})")
 
-    applied = set()
+    applied = detect_applied_layers()
     for sample in samples:
         la, lb = sample.focus_layers
         points = [
@@ -1351,7 +1562,7 @@ def run_dl_robust(con, args, run_id):
         int(hashlib.md5(run_id.encode()).hexdigest()[:8], 16)
     )
 
-    applied = set()
+    applied = detect_applied_layers()
     for pair in DL_CANDIDATE_PAIRS:
         if pair == ("L2", "L3a"):
             if not C.K3S_KUBECONFIG.exists():
@@ -1360,12 +1571,13 @@ def run_dl_robust(con, args, run_id):
                     f"run {C.K3S_BOOTSTRAP} first. Skipping this pair.")
                 continue
             draws = l2_l3a_robustness_draws_k3s(DL_ROBUSTNESS_SAMPLES, mc_seed)
+            draws = shard(draws, args)
             log(f"  DL-robust {pair} [k3s, L2 freely permutable]: "
                 f"{len(draws)} draws x 2 points each (seed={mc_seed})")
             prev_kubeconfig = os.environ.get("KUBECONFIG")
             os.environ["KUBECONFIG"] = str(C.K3S_KUBECONFIG)
             log(f"  [k3s] KUBECONFIG switched to {C.K3S_KUBECONFIG} for (L2,L3a) robustness draws")
-            applied_k3s = set()
+            applied_k3s = detect_applied_layers_k3s()
             try:
                 for d in draws:
                     points = [
@@ -1389,6 +1601,7 @@ def run_dl_robust(con, args, run_id):
 
         # (L5,L6) and (L1,L7): unchanged — main KIND cluster, generic sampler
         samples = dl_robustness_sampler(pair, seed=mc_seed)
+        samples = shard(samples, args)
         log(f"  DL-robust {pair}: {len(samples)} SampledConditions x 2 points each "
             f"(seed={mc_seed})")
         for sample in samples:
@@ -1442,6 +1655,7 @@ def run_l2_l3a_sep(con, args, run_id):
         int(hashlib.md5(run_id.encode()).hexdigest()[:8], 16)
     )
     samples = l2_l3a_separation_sampler(seed=mc_seed)
+    samples = shard(samples, args)
     log(f"  L2-L3a separation (k3s): {len(samples)} SampledConditions x 4 points each "
         f"(seed={mc_seed})")
 
@@ -1449,7 +1663,7 @@ def run_l2_l3a_sep(con, args, run_id):
     os.environ["KUBECONFIG"] = str(C.K3S_KUBECONFIG)
     log(f"  [k3s] KUBECONFIG switched to {C.K3S_KUBECONFIG} for this mode")
 
-    applied = set()
+    applied = detect_applied_layers_k3s()
     try:
         for sample in samples:
             points = [
@@ -1504,6 +1718,18 @@ def main():
     ap.add_argument("--dry-run",    action="store_true")
     ap.add_argument("--run-id",     default=None,
                     help="Named run ID. Auto-generated if not supplied.")
+    ap.add_argument("--shard-count", type=int, default=None,
+                    help="Split this mode's MC draw list across N parallel "
+                         "workers on the same substrate (see shard()). "
+                         "Every worker must pass the SAME --run-id, "
+                         "--mc-seed (or let it derive from run-id), and "
+                         "--shard-count, differing only in --shard-index — "
+                         "otherwise workers won't agree on the full draw "
+                         "list and shards will overlap or leave gaps. "
+                         "Ignored by --mode sequential (shard --configs "
+                         "across workers directly instead).")
+    ap.add_argument("--shard-index", type=int, default=0,
+                    help="This worker's 0-based shard index, < --shard-count.")
     args = ap.parse_args()
 
     run_id = args.run_id or ("run_" + datetime.now().strftime("%Y%m%d_%H%M%S"))

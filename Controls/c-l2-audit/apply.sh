@@ -33,6 +33,12 @@ K3S_CONFIG_DIR="${K3S_CONFIG_DIR:-/etc/rancher/k3s}"
 K3S_CONFIG_YAML="${K3S_CONFIG_DIR}/config.yaml"
 AUDIT_POLICY_DST="${K3S_CONFIG_DIR}/c-l2-audit-policy.yaml"
 AUDIT_LOG_PATH="${AUDIT_LOG_PATH:-/var/log/k3s-audit.log}"
+# K3S_SERVICE lets parallel workers each restart their OWN native k3s
+# instance (see Infra/k3s/bootstrap.sh's K3S_INSTANCE) instead of every
+# worker fighting over the single hardcoded "k3s" systemd service. Pass the
+# same K3S_SERVICE/K3S_CONFIG_DIR values bootstrap.sh printed for this
+# worker's instance.
+K3S_SERVICE="${K3S_SERVICE:-k3s}"
 
 echo "[c-l2-audit] [1/3] installing audit policy to ${AUDIT_POLICY_DST}"
 sudo mkdir -p "${K3S_CONFIG_DIR}"
@@ -51,8 +57,8 @@ EOF
   echo "  appended kube-apiserver-arg block"
 fi
 
-echo "[c-l2-audit] [3/3] restarting k3s and waiting for apiserver"
-sudo systemctl restart k3s
+echo "[c-l2-audit] [3/3] restarting ${K3S_SERVICE} and waiting for apiserver"
+sudo systemctl restart "${K3S_SERVICE}"
 for i in $(seq 1 30); do
   kubectl get --raw='/healthz' >/dev/null 2>&1 && break
   sleep 2

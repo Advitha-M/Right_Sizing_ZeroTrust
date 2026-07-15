@@ -1,0 +1,33 @@
+[Unit]
+Description=Right-Sizing Zero Trust — canonical build (sequential mode)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ztadmin
+WorkingDirectory=/opt/rszt
+# Number of parallel KIND clusters this VM runs concurrently — tune to the
+# VM's CPU/RAM (each cluster is 5 KIND nodes). Edit here or via
+# `systemctl edit rszt-canonical.service` rather than exporting it ad hoc,
+# since systemd services don't inherit an interactive shell's environment.
+Environment=NUM_WORKERS=4
+ExecStart=/opt/rszt/azure/run_canonical.sh
+# Multi-day unattended run: retry on ANY failure (crash, transient network
+# blip, a kubectl call that timed out), forever — StartLimitIntervalSec=0
+# disables systemd's default "give up after 5 restarts in 10s" burst limit,
+# which would otherwise leave the VM sitting idle mid-study after a bad
+# patch of retries. Safe to retry indefinitely now that:
+#   - driver.py's `applied` set is seeded from real cluster state on
+#     startup (detect_applied_layers()/_k3s()), not assumed-empty
+#   - run_trials() resumes from the last recorded trial index per
+#     (run_id, config, attack) instead of re-running from trial 1
+# RUN_ID itself is persisted to disk by run_canonical.sh on first start
+# and reused on every restart, so those two fixes actually apply across
+# restarts rather than each restart quietly starting a fresh run_id.
+Restart=on-failure
+RestartSec=120
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

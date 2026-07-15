@@ -220,8 +220,15 @@ _pf_check_kind() {
 # All 5 nodes (1 control-plane + 4 workers, brief Section 11's "5-node KIND
 # cluster") report Ready — used both after creation and to decide whether a
 # pre-existing cluster is actually usable or silently broken.
+#
+# CLUSTER_NAME (env, default "zt-lab") — Infra/KIND/recover.sh already
+# established this convention; reused here (and by
+# _pf_create_kind_cluster_with_retry / _pf_ensure_kind_cluster below) so
+# parallel workers on one VM can each stand up their own independently-named
+# KIND cluster instead of every process fighting over one hardcoded "zt-lab".
 _pf_kind_cluster_ready() {
-  local kubeconfig_flag=(--context kind-zt-lab)
+  local name="${CLUSTER_NAME:-zt-lab}"
+  local kubeconfig_flag=(--context "kind-${name}")
   local ready_count
   ready_count=$(kubectl "${kubeconfig_flag[@]}" get nodes --no-headers 2>/dev/null \
     | awk '$2=="Ready"' | wc -l)
@@ -235,16 +242,19 @@ _pf_kind_cluster_ready() {
 # cluster` by hand before re-running.
 _pf_create_kind_cluster_with_retry() {
   local cfg="$1"
-  if kind create cluster --config "$cfg" --wait 3m; then
+  local name="${CLUSTER_NAME:-zt-lab}"
+  # --name overrides whatever `name:` kind-cluster.yaml itself has, so the
+  # yaml doesn't need per-worker templating — one flag is enough.
+  if kind create cluster --name "$name" --config "$cfg" --wait 3m; then
     return 0
   fi
   _pf_warn "kind create cluster failed on the first attempt — cleaning up any " \
            "partial state and retrying once (no manual 'kind delete cluster' " \
            "needed)"
-  kind delete cluster --name zt-lab 2>/dev/null || true
-  docker rm -f zt-lab-control-plane zt-lab-worker zt-lab-worker2 \
-    zt-lab-worker3 zt-lab-worker4 >/dev/null 2>&1 || true
-  kind create cluster --config "$cfg" --wait 3m || \
+  kind delete cluster --name "$name" 2>/dev/null || true
+  docker rm -f "${name}-control-plane" "${name}-worker" "${name}-worker2" \
+    "${name}-worker3" "${name}-worker4" >/dev/null 2>&1 || true
+  kind create cluster --name "$name" --config "$cfg" --wait 3m || \
     _pf_fail "kind create cluster failed twice in a row (see output above) — " \
              "this usually means docker itself is unhealthy or out of " \
              "resources, not something a retry can paper over."
@@ -258,6 +268,8 @@ _pf_ensure_kind_cluster() {
   # with a real `kind` binary on PATH).
   command -v kind >/dev/null 2>&1 || return 0
 
+  local name="${CLUSTER_NAME:-zt-lab}"
+
   # Locate kind-cluster.yaml by search rather than a hardcoded folder name —
   # previously hardcoded to Infra/files(1)/, which would silently break (and
   # require a manual code edit) the moment that folder is renamed. `find`
@@ -270,24 +282,24 @@ _pf_ensure_kind_cluster() {
     _pf_fail "could not find kind-cluster.yaml anywhere under ${_PF_INFRA_DIR} " \
              "(searched 2 levels deep) — it may have been moved or deleted."
 
-  _pf_log "checking for the 'zt-lab' KIND cluster..."
-  if kind get clusters 2>/dev/null | grep -qx "zt-lab"; then
+  _pf_log "checking for the '${name}' KIND cluster..."
+  if kind get clusters 2>/dev/null | grep -qx "$name"; then
     if _pf_kind_cluster_ready; then
-      _pf_log "  OK: zt-lab cluster already exists and all nodes are Ready"
+      _pf_log "  OK: ${name} cluster already exists and all nodes are Ready"
       return 0
     fi
-    _pf_warn "zt-lab cluster exists but isn't fully Ready — deleting and " \
+    _pf_warn "${name} cluster exists but isn't fully Ready — deleting and " \
              "recreating rather than leaving a broken cluster for someone to " \
              "diagnose by hand"
-    kind delete cluster --name zt-lab 2>/dev/null || true
+    kind delete cluster --name "$name" 2>/dev/null || true
   fi
 
-  _pf_log "  creating zt-lab cluster (kind create cluster --config ${cfg})..."
+  _pf_log "  creating ${name} cluster (kind create cluster --name ${name} --config ${cfg})..."
   _pf_create_kind_cluster_with_retry "$cfg"
   _pf_kind_cluster_ready || \
-    _pf_fail "zt-lab cluster was created but nodes never reached Ready — " \
+    _pf_fail "${name} cluster was created but nodes never reached Ready — " \
              "check 'kubectl get nodes' / 'docker ps' for what's stuck."
-  _pf_log "  zt-lab cluster created and all nodes Ready"
+  _pf_log "  ${name} cluster created and all nodes Ready"
 }
 
 _pf_check_kubectl() {

@@ -57,7 +57,10 @@
 # =============================================================================
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CP_CONTAINER="zt-lab-control-plane"
+# CLUSTER_NAME lets parallel workers each target their own KIND cluster
+# (kind's own "<cluster-name>-control-plane" naming convention) instead of
+# the single hardcoded "zt-lab" this used to assume.
+CP_CONTAINER="${CLUSTER_NAME:-zt-lab}-control-plane"
 ENC_CONFIG_PATH="/etc/kubernetes/pki/encryption-config.yaml"
 APISERVER_MANIFEST="/etc/kubernetes/manifests/kube-apiserver.yaml"
 

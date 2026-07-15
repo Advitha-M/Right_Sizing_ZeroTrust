@@ -18,7 +18,7 @@
 # =============================================================================
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CP_CONTAINER="zt-lab-control-plane"
+CP_CONTAINER="${CLUSTER_NAME:-zt-lab}-control-plane"
 APISERVER_MANIFEST="/etc/kubernetes/manifests/kube-apiserver.yaml"
 
 # ── Part 4: VPC-segmentation proxy ───────────────────────────────────────────

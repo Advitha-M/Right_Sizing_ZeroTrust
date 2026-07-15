@@ -24,6 +24,7 @@ Values NOT hardcoded elsewhere in constants.py live here on purpose —
 constants.py is explicit that it holds shared *vocabulary* (conditions,
 tenants, techniques), not filesystem layout.
 """
+import os
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -31,7 +32,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 ATTACKS_DIR  = REPO_ROOT / "Attacks"
 CONTROLS_DIR = REPO_ROOT / "Controls"
 LOGS_DIR     = REPO_ROOT / "logs"
-RESULTS_DB   = REPO_ROOT / "results" / "results.db"
+RESULTS_DB   = Path(os.environ.get("ZT_RESULTS_DB",
+                                    str(REPO_ROOT / "results" / "results.db")))
 
 # CLEANUP_DIR / reset_trial.sh does not exist in this repo — driver.py's
 # reset_state() already falls back to inline kubectl cleanup commands when
@@ -79,9 +81,11 @@ def remove_script(layer_id: str) -> Path:
 K3S_DIR        = REPO_ROOT / "Infra" / "k3s"
 K3S_BOOTSTRAP  = K3S_DIR / "bootstrap.sh"
 K3S_TEARDOWN   = K3S_DIR / "teardown.sh"
-# Populated by bootstrap.sh (copies /etc/rancher/k3s/k3s.yaml here with the
-# server URL left as-is — single-node install, no rewrite needed).
-K3S_KUBECONFIG = K3S_DIR / "k3s.yaml"
+# Populated by bootstrap.sh (copies the instance's k3s.yaml here). Override
+# via ZT_K3S_KUBECONFIG so parallel workers on one VM each point at their
+# own native k3s instance (see bootstrap.sh's K3S_INSTANCE) instead of all
+# sharing this one hardcoded path.
+K3S_KUBECONFIG = Path(os.environ.get("ZT_K3S_KUBECONFIG", str(K3S_DIR / "k3s.yaml")))
 
 # L2 + the existing 7 LAYERS, in canonical build order — used ONLY by
 # set_config_k3s(). The main set_config() keeps using LAYERS (no L2 entry)
@@ -103,7 +107,6 @@ def remove_script_k3s(layer_id: str) -> Path:
 # Mirrors harness/config.env's ":${VAR:=...}" defaults so a bare
 # `python3 Driver/driver.py` run and a harness/run_attacks.sh run agree
 # unless the caller overrides via environment.
-import os
 
 BASE_SEED      = int(os.environ.get("BASE_SEED", 42))
 # Brief v7 Section 10.1: "dl(t,k,j) = infinity if no alert fires within 90

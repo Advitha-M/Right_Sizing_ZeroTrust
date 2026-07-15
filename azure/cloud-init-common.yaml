@@ -1,0 +1,18 @@
+#cloud-config
+package_update: true
+packages:
+  - git
+  - python3
+  - python3-pip
+  - jq
+runcmd:
+  # az cli (needed by run_canonical.sh / run_shapley.sh to self-deallocate
+  # via the VM's managed identity — no credentials stored on disk)
+  - curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+  - git clone https://github.com/Advitha-M/Right_Sizing_ZeroTrust.git /opt/rszt
+  - chown -R ztadmin:ztadmin /opt/rszt
+  # Docker + kind + kubectl + helm + scipy/numpy etc. are handled by the
+  # repo's own Infra/preflight.sh (sourced by Infra/KIND/setup.sh and
+  # Infra/k3s/bootstrap.sh) the first time either is invoked — deliberately
+  # not duplicated here so there is exactly one source of truth for
+  # dependency versions.

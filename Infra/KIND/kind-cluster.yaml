@@ -17,8 +17,27 @@ name: zt-lab
 # Section 1): it is baked into the kube-apiserver static manifest at cluster
 # bootstrap via the audit-policy wiring below, not toggled by any Controls/
 # script. Only the audit-logging half of L2 is implementable this way; see
-# infra/audit/audit-policy.yaml's header for what's out of scope on a local
+# Infra/audit/audit-policy.yaml's header for what's out of scope on a local
 # KIND substrate (no OIDC issuer, no private endpoint concept).
+#
+# CORRECTED (real cluster-boot failure): extraMounts.hostPath below was
+# "./infra/audit/" (lowercase, no such folder — the real file lived at
+# Infra/KIND/audit-policy.yaml). kind resolves a relative extraMounts
+# hostPath against the CURRENT WORKING DIRECTORY *at the moment `kind
+# create cluster` runs*, not against this file's own location — and docker
+# silently creates an empty directory for a nonexistent bind-mount source
+# instead of erroring. So this never failed loudly at cluster-create time;
+# it produced a KIND cluster whose control-plane container had an EMPTY
+# /etc/kubernetes/policies, which kube-apiserver then refused to start
+# without (--audit-policy-file is mandatory once set), which cascades into
+# port 6443 never coming up, kubectl/`/version` failing, and kubelet never
+# registering — every symptom traces back to this one missing file. Moved
+# the real file to Infra/audit/audit-policy.yaml (matching what this
+# comment always claimed, just case-corrected) and fixed the path below to
+# match. Infra/preflight.sh's _pf_create_kind_cluster_with_retry() also now
+# explicitly cds to the repo root before invoking `kind create cluster`
+# rather than trusting inherited CWD, so this class of bug can't recur from
+# a different invocation context.
 #
 # Cilium is NOT installed by this file (disableDefaultCNI only prepares the
 # cluster for it) and there is no Makefile in this repo to do it either —
@@ -60,7 +79,7 @@ nodes:
               readOnly: false
               pathType: DirectoryOrCreate
     extraMounts:
-      - hostPath: ./infra/audit/
+      - hostPath: ./Infra/audit/
         containerPath: /etc/kubernetes/policies
   # One dedicated worker per tenant node pool (v6 Section 13: 5-node cluster,
   # 1 shared system pool [this control-plane node] + 4 user pools, one per

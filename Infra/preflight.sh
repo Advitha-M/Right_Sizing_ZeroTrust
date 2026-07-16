@@ -243,21 +243,43 @@ _pf_kind_cluster_ready() {
 _pf_create_kind_cluster_with_retry() {
   local cfg="$1"
   local name="${CLUSTER_NAME:-zt-lab}"
-  # --name overrides whatever `name:` kind-cluster.yaml itself has, so the
-  # yaml doesn't need per-worker templating — one flag is enough.
-  if kind create cluster --name "$name" --config "$cfg" --wait 3m; then
-    return 0
-  fi
+  # CORRECTED (real cluster-boot failure, traced to kind-cluster.yaml's
+  # extraMounts.hostPath): kind resolves a relative extraMounts hostPath
+  # against the CURRENT WORKING DIRECTORY at the moment `kind create
+  # cluster` runs — NOT relative to the config file's own location. This
+  # function previously just inherited whatever CWD the caller happened to
+  # leave it in (worked only because Infra/KIND/setup.sh happens to cd to
+  # the repo root before sourcing this). Pin it explicitly instead of
+  # trusting that — a future caller invoking this from a different CWD
+  # (e.g. `cd Infra/KIND && kind create cluster --config kind-cluster.yaml`,
+  # a very natural thing to try by hand) would otherwise silently resolve
+  # relative hostPaths in kind-cluster.yaml against the wrong directory,
+  # and docker creates an empty directory for a nonexistent bind-mount
+  # source rather than erroring — so this fails silently, not loudly.
+  local repo_root
+  repo_root="$(cd "${_PF_INFRA_DIR}/.." && pwd)"
+  (
+    cd "$repo_root" || _pf_fail "could not cd to repo root (${repo_root}) before " \
+                                 "kind create cluster — extraMounts hostPaths in " \
+                                 "kind-cluster.yaml are resolved relative to CWD, " \
+                                 "so this has to succeed first."
+    # --name overrides whatever `name:` kind-cluster.yaml itself has, so the
+    # yaml doesn't need per-worker templating — one flag is enough.
+    kind create cluster --name "$name" --config "$cfg" --wait 3m
+  ) && return 0
+
   _pf_warn "kind create cluster failed on the first attempt — cleaning up any " \
            "partial state and retrying once (no manual 'kind delete cluster' " \
            "needed)"
   kind delete cluster --name "$name" 2>/dev/null || true
   docker rm -f "${name}-control-plane" "${name}-worker" "${name}-worker2" \
     "${name}-worker3" "${name}-worker4" >/dev/null 2>&1 || true
-  kind create cluster --name "$name" --config "$cfg" --wait 3m || \
-    _pf_fail "kind create cluster failed twice in a row (see output above) — " \
-             "this usually means docker itself is unhealthy or out of " \
-             "resources, not something a retry can paper over."
+  (
+    cd "$repo_root" || _pf_fail "could not cd to repo root (${repo_root}) for retry"
+    kind create cluster --name "$name" --config "$cfg" --wait 3m
+  ) || _pf_fail "kind create cluster failed twice in a row (see output above) — " \
+                 "this usually means docker itself is unhealthy or out of " \
+                 "resources, not something a retry can paper over."
 }
 
 _pf_ensure_kind_cluster() {

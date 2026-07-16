@@ -1,0 +1,45 @@
+# infra/audit/audit-policy.yaml
+# -----------------------------------------------------------------------------
+# Implements the audit-logging half of L2 (v6: the sole always-active base
+# layer — Driver/constants.py LAYER_LABELS["L2"] = "Cluster access control
+# (audit logging) — base layer"). Mounted read-only into the control-plane
+# static pod via infra/kind-cluster.yaml's extraVolumes/extraMounts, so it is
+# active from cluster bootstrap for every condition C0-C7 — never toggled by
+# a Controls/ apply.sh/remove.sh pair like the other seven layers.
+#
+# SCOPE NOTE: the full L2 mechanism per the brief also includes OIDC
+# authentication and a private-only API endpoint. Neither has a meaningful
+# local-KIND proxy (no external IdP wired up; "private endpoint" is a
+# cloud-networking concept without a single-Docker-host analogue) — this is
+# the same kind of documented substrate limitation as L1_SCOPE_NOTE in
+# Driver/constants.py, not a silent scope narrowing. Only the audit-logging
+# component is implemented and measured.
+# -----------------------------------------------------------------------------
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  - "RequestReceived"
+rules:
+  # Secrets/configmaps: Metadata only (avoid logging secret values themselves)
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets", "configmaps"]
+  # RBAC objects: full request/response — needed to audit C2/L3a (RBAC)
+  # changes and any privilege-escalation attempt (A2, A3).
+  - level: RequestResponse
+    resources:
+      - group: "rbac.authorization.k8s.io"
+        resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+  # Pods, exec/attach, and service account tokens: full request/response —
+  # this is the "rejected API request" shared detection event that the
+  # (L2, L3a) DL candidate pair (Driver/constants.DL_CANDIDATE_PAIRS) relies
+  # on, and covers A1-t3 (direct pod-to-pod API), A2 (token theft/replay),
+  # A4 (unauthorized API access).
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["pods", "pods/exec", "pods/attach", "serviceaccounts", "serviceaccounts/token"]
+  # Everything else: Metadata catch-all, so "full audit logging" holds for
+  # the whole apiserver surface, not just the resources called out above.
+  - level: Metadata

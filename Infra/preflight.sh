@@ -229,10 +229,22 @@ _pf_check_kind() {
 _pf_kind_cluster_ready() {
   local name="${CLUSTER_NAME:-zt-lab}"
   local kubeconfig_flag=(--context "kind-${name}")
-  local ready_count
-  ready_count=$(kubectl "${kubeconfig_flag[@]}" get nodes --no-headers 2>/dev/null \
-    | awk '$2=="Ready"' | wc -l)
-  [[ "${ready_count:-0}" -ge 5 ]]
+  # CORRECTED (real run failure): previously required all 5 nodes to report
+  # Ready, which is structurally impossible to satisfy at this point in the
+  # pipeline — kind-cluster.yaml sets disableDefaultCNI: true, so kubelet
+  # cannot report Ready on ANY node until Cilium is installed, and that only
+  # happens later, in setup.sh's Phase 1 — which runs AFTER this check, not
+  # before. Every `kind create cluster` (fresh or retried) was guaranteed to
+  # fail this exact check regardless of whether anything was actually
+  # wrong, which is exactly what happened on a real run. The right bar here
+  # is "API server reachable and all 5 nodes registered" — NotReady due to
+  # missing CNI is the expected, correct transient state at this point, not
+  # a failure. The real "5 nodes Ready" bar already exists, correctly
+  # placed, in setup.sh's verify() (checked after Phase 1 installs Cilium)
+  # — this just needed to stop duplicating that check prematurely.
+  local registered_count
+  registered_count=$(kubectl "${kubeconfig_flag[@]}" get nodes --no-headers 2>/dev/null | wc -l)
+  [[ "${registered_count:-0}" -ge 5 ]]
 }
 
 # Wraps `kind create cluster` with one self-healing retry: if creation fails
@@ -265,7 +277,17 @@ _pf_create_kind_cluster_with_retry() {
                                  "so this has to succeed first."
     # --name overrides whatever `name:` kind-cluster.yaml itself has, so the
     # yaml doesn't need per-worker templating — one flag is enough.
-    kind create cluster --name "$name" --config "$cfg" --wait 3m
+    # CORRECTED: --wait 3m previously here waited for control-plane Ready,
+    # which — same root cause as _pf_kind_cluster_ready's fix above — is
+    # structurally impossible before Cilium is installed (disableDefaultCNI:
+    # true). kind treats a --wait timeout as non-fatal (prints a WARNING,
+    # still returns success), so this wasn't itself the cause of the
+    # reported failure, but it was burning a fixed 3 real minutes doing
+    # nothing useful on every single cluster creation. Node registration
+    # (what we actually check for now) is fast — polled right after this
+    # returns, in _pf_ensure_kind_cluster, instead of waiting on the wrong
+    # condition for a fixed 3 minutes first.
+    kind create cluster --name "$name" --config "$cfg"
   ) && return 0
 
   _pf_warn "kind create cluster failed on the first attempt — cleaning up any " \
@@ -276,7 +298,7 @@ _pf_create_kind_cluster_with_retry() {
     "${name}-worker3" "${name}-worker4" >/dev/null 2>&1 || true
   (
     cd "$repo_root" || _pf_fail "could not cd to repo root (${repo_root}) for retry"
-    kind create cluster --name "$name" --config "$cfg" --wait 3m
+    kind create cluster --name "$name" --config "$cfg"
   ) || _pf_fail "kind create cluster failed twice in a row (see output above) — " \
                  "this usually means docker itself is unhealthy or out of " \
                  "resources, not something a retry can paper over."
@@ -307,21 +329,36 @@ _pf_ensure_kind_cluster() {
   _pf_log "checking for the '${name}' KIND cluster..."
   if kind get clusters 2>/dev/null | grep -qx "$name"; then
     if _pf_kind_cluster_ready; then
-      _pf_log "  OK: ${name} cluster already exists and all nodes are Ready"
+      _pf_log "  OK: ${name} cluster already exists and all 5 nodes are " \
+              "registered (full node Ready status depends on Cilium, " \
+              "installed later in Phase 1 — see setup.sh's verify())"
       return 0
     fi
-    _pf_warn "${name} cluster exists but isn't fully Ready — deleting and " \
-             "recreating rather than leaving a broken cluster for someone to " \
-             "diagnose by hand"
+    _pf_warn "${name} cluster exists but fewer than 5 nodes are registered " \
+             "— deleting and recreating rather than leaving a broken " \
+             "cluster for someone to diagnose by hand"
     kind delete cluster --name "$name" 2>/dev/null || true
   fi
 
   _pf_log "  creating ${name} cluster (kind create cluster --name ${name} --config ${cfg})..."
   _pf_create_kind_cluster_with_retry "$cfg"
+
+  # Poll rather than check once immediately: without --wait, kind returns
+  # as soon as the join commands are issued, and the API server can take a
+  # few more seconds to reflect all 5 nodes.
+  local _tries=0
+  until _pf_kind_cluster_ready || [[ "$_tries" -ge 12 ]]; do
+    sleep 5
+    _tries=$((_tries + 1))
+  done
   _pf_kind_cluster_ready || \
-    _pf_fail "${name} cluster was created but nodes never reached Ready — " \
-             "check 'kubectl get nodes' / 'docker ps' for what's stuck."
-  _pf_log "  ${name} cluster created and all nodes Ready"
+    _pf_fail "${name} cluster was created but fewer than 5 nodes ever " \
+             "registered after 60s — check 'kubectl get nodes' / 'docker ps' " \
+             "for what's stuck (this does NOT mean nodes reached Ready — " \
+             "that requires Cilium, installed later; this only means the " \
+             "nodes themselves never showed up at all, a more basic failure)."
+  _pf_log "  ${name} cluster created, all 5 nodes registered (not yet " \
+          "Ready — that's expected until Phase 1 installs Cilium)"
 }
 
 _pf_check_kubectl() {

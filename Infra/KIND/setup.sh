@@ -51,7 +51,16 @@
 #     apply.sh scripts all explicitly assume this phase already ran.
 # ============================================================================
 set -o pipefail
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# CORRECTED (real run failure): this was "$(dirname "${BASH_SOURCE[0]}")/..",
+# which only walks up ONE directory level. Infra/KIND/setup.sh sits TWO
+# levels below the repo root, so that resolved REPO_ROOT to .../Infra
+# instead of the real repo root — silently wrong for the `cd "$REPO_ROOT"`
+# below (meaning every phase ran from the wrong working directory, not just
+# the line below) and for locating preflight.sh, where it produced the
+# doubled path .../Infra/Infra/preflight.sh. Matches the same two-step
+# HERE-then-../.. pattern Infra/k3s/bootstrap.sh already used correctly.
+REPO_ROOT="$(cd "${HERE}/../.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
 # ADDED (validation pass): dependency preflight — checks docker/kind/kubectl/
@@ -61,7 +70,24 @@ cd "$REPO_ROOT" || exit 1
 # worked. See Infra/preflight.sh's header for exactly what it can and can't
 # self-heal (it cannot fix missing internet access or undersized hardware —
 # those are reported as a hard-fail / warning respectively, not restarted).
-source "${REPO_ROOT}/Infra/preflight.sh" kind "$0" "$@"
+#
+# CORRECTED (real run failure): `source` on a missing/broken file does NOT
+# abort this script (there's no `set -e`, deliberately — see the top-level
+# dispatch's use of function calls where a bare set -e would misbehave) —
+# it previously just logged bash's own "No such file or directory" to
+# stderr and fell through into Phase 1, which then tried to install Cilium
+# against a cluster that was never created because preflight.sh (and
+# therefore _pf_ensure_kind_cluster) never actually ran. That's what
+# produced the confusing downstream "127.0.0.1:<port>: EOF" error — a
+# symptom of this failing silently, not a separate problem. Now checked
+# explicitly and hard-failed here instead, at the actual point of failure.
+if ! source "${REPO_ROOT}/Infra/preflight.sh" kind "$0" "$@"; then
+  echo "[setup.sh] FAIL: Infra/preflight.sh did not complete successfully " \
+       "(see output above) — stopping here rather than continuing into " \
+       "phases that assume a cluster/toolchain preflight already verified " \
+       "actually ran." >&2
+  exit 1
+fi
 
 TENANTS=(tenant-lowpriv tenant-finserv tenant-partner tenant-saas)
 CILIUM_VERSION="1.19.3"

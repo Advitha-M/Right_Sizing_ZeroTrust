@@ -483,13 +483,23 @@ if $_PF_NEEDS_RESTART; then
   _pf_log "one or more dependencies were just installed — restarting " \
           "${_PF_CALLER} once so they're picked up cleanly"
   export ZT_PREFLIGHT_RESTARTS=1
+  # CORRECTED (real run failure): this used to `exec "$_PF_CALLER" ...`
+  # directly, which requires the caller script's own +x bit to be set —
+  # but the original invocation this whole run started from was
+  # `bash Infra/KIND/setup.sh all`, which never needed that bit at all
+  # (bash was handed the path explicitly). A fresh clone/scp'd copy without
+  # +x set failed here with "Permission denied" right after installs
+  # completed, discarding a restart that had otherwise gone perfectly.
+  # Re-invoke through bash explicitly instead, matching the original
+  # invocation, so this never depends on file permissions.
+  local _pf_interpreter="${BASH:-bash}"
   if $_PF_DOCKER_FRESH && command -v sg >/dev/null 2>&1; then
     # `exec "$0"` alone would NOT pick up the fresh docker group membership
     # in this same login session — re-exec through `sg docker` so it does.
-    _pf_cmd="$(printf '%q ' "$_PF_CALLER" "${_PF_CALLER_ARGS[@]}")"
+    _pf_cmd="$(printf '%q ' "$_pf_interpreter" "$_PF_CALLER" "${_PF_CALLER_ARGS[@]}")"
     exec sg docker -c "$_pf_cmd"
   else
-    exec "$_PF_CALLER" "${_PF_CALLER_ARGS[@]}"
+    exec "$_pf_interpreter" "$_PF_CALLER" "${_PF_CALLER_ARGS[@]}"
   fi
 fi
 

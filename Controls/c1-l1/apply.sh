@@ -54,6 +54,21 @@
 #  is toggled before L3b in a permuted ordering (unchanged from before);
 #  Dex and the vpc labels are NOT re-created here if phase5 hasn't run —
 #  Parts 3/4 log a (warn) and skip rather than failing the whole script.
+#
+#  HARDENED (post-smoke3 incident): Parts 1 and 3 both edit the LIVE
+#  kube-apiserver static pod manifest with sed -i. Previously neither edit
+#  was verified — a malformed result silently produced a manifest kubelet
+#  could not parse ("cannot unmarshal ... command ... of type string"),
+#  kubelet dropped the apiserver static pod entirely (no container at all,
+#  not even a crashed one), and this script still printed "APPLIED" and
+#  exited 0 because `set -uo pipefail` (no `-e`) doesn't stop on a bad sed,
+#  and the old /healthz poll only ever WARNed on timeout. The orchestrator's
+#  Tier 1 checks were the only thing that caught it, several steps later.
+#  patch_manifest_flag() below now: backs up the manifest before every edit,
+#  structurally validates the command: block after, rolls back and hard-
+#  fails (exit 1) if the edit produced something invalid OR if the apiserver
+#  doesn't come back healthy within the wait window — instead of leaving a
+#  dead control plane behind with no signal.
 # =============================================================================
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,6 +78,119 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CP_CONTAINER="${CLUSTER_NAME:-zt-lab}-control-plane"
 ENC_CONFIG_PATH="/etc/kubernetes/pki/encryption-config.yaml"
 APISERVER_MANIFEST="/etc/kubernetes/manifests/kube-apiserver.yaml"
+
+# ── Manifest edit safety net ────────────────────────────────────────────────
+#
+# validate_apiserver_manifest(): dependency-free structural check (no python3
+# or pyyaml required inside the kindest/node container). Confirms:
+#   - no tab characters (YAML forbids tabs for indentation — the single most
+#     common cause of a "list became a scalar" parse error like the one that
+#     bit smoke3)
+#   - exactly one "- command:" key
+#   - every line inside the command: block is a "- " list item, right up to
+#     the next sibling key (image:, ports:, etc.) — this is exactly the
+#     structural shape kubelet's Go unmarshaler expects; anything else is
+#     precisely what produces "cannot unmarshal ... command ... of type
+#     string"
+#   - "kube-apiserver" is still present as a command entry (sanity check
+#     that the anchor line sed matched against wasn't itself mangled)
+validate_apiserver_manifest() {
+  local content
+  content="$(docker exec "$CP_CONTAINER" cat "$APISERVER_MANIFEST" 2>/dev/null)"
+  if [[ -z "$content" ]]; then
+    echo "  [VALIDATE] FAIL — could not read $APISERVER_MANIFEST (empty or unreadable)"
+    return 1
+  fi
+  if grep -qP '\t' <<<"$content"; then
+    echo "  [VALIDATE] FAIL — manifest contains tab character(s) (YAML forbids tabs for indentation)"
+    return 1
+  fi
+  local cmd_count
+  cmd_count="$(grep -cP '^\s*-\s*command:\s*$' <<<"$content")"
+  if [[ "$cmd_count" -ne 1 ]]; then
+    echo "  [VALIDATE] FAIL — expected exactly one '- command:' key, found $cmd_count"
+    return 1
+  fi
+  local in_block=0 bad_line=""
+  while IFS= read -r line; do
+    if [[ "$in_block" -eq 0 ]]; then
+      [[ "$line" =~ ^[[:space:]]*-[[:space:]]command:[[:space:]]*$ ]] && in_block=1
+      continue
+    fi
+    # still inside the command: block — must be a "<indent>- <value>" list item
+    if [[ "$line" =~ ^[[:space:]]+-[[:space:]] ]]; then
+      continue
+    fi
+    # a line that starts a new sibling key (e.g. "    image:") ends the
+    # block cleanly — that's expected, stop walking
+    if [[ "$line" =~ ^[[:space:]]+[A-Za-z] ]]; then
+      break
+    fi
+    # anything else inside the block (blank line, garbage, a line that
+    # doesn't parse as either) is the corruption we're looking for
+    bad_line="$line"
+    break
+  done <<<"$content"
+  if [[ -n "$bad_line" ]]; then
+    echo "  [VALIDATE] FAIL — malformed line inside command: block: ${bad_line}"
+    return 1
+  fi
+  if ! grep -qP '^\s*-\s*kube-apiserver\s*$' <<<"$content"; then
+    echo "  [VALIDATE] FAIL — 'kube-apiserver' entry missing from command list (anchor line was mangled)"
+    return 1
+  fi
+  echo "  [VALIDATE] OK — command: block structurally sound"
+  return 0
+}
+
+# patch_manifest_flag(): apply one sed edit to the live apiserver manifest
+# with a full backup/validate/rollback safety net. On ANY failure (bad sed
+# result, or apiserver doesn't come back healthy) it restores the pre-edit
+# manifest and hard-fails (exit 1) instead of leaving a broken control
+# plane behind with just a WARN. $1 = human-readable label for logging,
+# $2 = the sed program to run.
+patch_manifest_flag() {
+  local label="$1"
+  local sed_prog="$2"
+  local backup="${APISERVER_MANIFEST}.bak.$(date +%s)"
+
+  echo "  backing up manifest -> ${backup}"
+  if ! docker exec "$CP_CONTAINER" cp "$APISERVER_MANIFEST" "$backup"; then
+    echo "  [ABORT] could not back up manifest before editing for ${label} — refusing to edit"
+    return 1
+  fi
+
+  docker exec "$CP_CONTAINER" sed -i "$sed_prog" "$APISERVER_MANIFEST"
+
+  if ! validate_apiserver_manifest; then
+    echo "  [ROLLBACK] ${label} produced an invalid manifest — restoring backup"
+    docker exec "$CP_CONTAINER" cp "$backup" "$APISERVER_MANIFEST"
+    echo "  [ABORT] c1-l1 apply stopped — manifest restored to pre-${label} state"
+    return 1
+  fi
+
+  echo "  waiting for kubelet to restart apiserver (manifest-watch triggers automatically)..."
+  local up=0
+  for i in $(seq 1 30); do
+    kubectl get --raw='/healthz' >/dev/null 2>&1 && { up=1; break; }
+    sleep 2
+  done
+
+  if [[ "$up" -ne 1 ]]; then
+    echo "  [ROLLBACK] apiserver did not report healthy within 60s after ${label} — restoring backup"
+    docker exec "$CP_CONTAINER" cp "$backup" "$APISERVER_MANIFEST"
+    echo "  waiting for kubelet to pick up the restored manifest..."
+    for i in $(seq 1 30); do
+      kubectl get --raw='/healthz' >/dev/null 2>&1 && break
+      sleep 2
+    done
+    echo "  [ABORT] c1-l1 apply stopped — manifest restored to pre-${label} state"
+    return 1
+  fi
+
+  echo "  apiserver healthy after ${label}"
+  return 0
+}
 
 # ── Part 1: etcd encryption at rest ─────────────────────────────────────────
 
@@ -101,15 +229,11 @@ if docker exec "$CP_CONTAINER" test -f "$ENC_CONFIG_PATH" 2>/dev/null; then
     echo "  apiserver manifest already has --encryption-provider-config — skipping edit"
   else
     echo "  patching $APISERVER_MANIFEST to add --encryption-provider-config"
-    docker exec "$CP_CONTAINER" sed -i \
-      "s#- kube-apiserver#- kube-apiserver\n    - --encryption-provider-config=${ENC_CONFIG_PATH}#" \
-      "$APISERVER_MANIFEST"
-    echo "  waiting for kubelet to restart apiserver (manifest-watch triggers automatically)..."
-    for i in $(seq 1 30); do
-      kubectl get --raw='/healthz' >/dev/null 2>&1 && break
-      sleep 2
-    done
-    echo "  apiserver back up (or timed out waiting — check manually if apply seems incomplete)"
+    if ! patch_manifest_flag "Part 1 (encryption-provider-config)" \
+      "s#- kube-apiserver#- kube-apiserver\n    - --encryption-provider-config=${ENC_CONFIG_PATH}#"; then
+      echo "[c1-l1] FAILED at Part 1 — aborting rest of apply"
+      exit 1
+    fi
   fi
 fi
 
@@ -168,17 +292,13 @@ else
       docker exec "$CP_CONTAINER" chmod 644 "$DEX_CA_PATH"
     fi
     echo "  patching $APISERVER_MANIFEST to add --oidc-issuer-url=${DEX_ISSUER}"
-    docker exec "$CP_CONTAINER" sed -i \
-      "s#- kube-apiserver#- kube-apiserver\n    - --oidc-issuer-url=${DEX_ISSUER}\n    - --oidc-client-id=zt-lab-kubectl\n    - --oidc-username-claim=email\n    - --oidc-username-prefix=oidc:\n    - --oidc-ca-file=${DEX_CA_PATH}#" \
-      "$APISERVER_MANIFEST"
-    echo "  waiting for kubelet to restart apiserver (manifest-watch triggers automatically)..."
-    for i in $(seq 1 30); do
-      kubectl get --raw='/healthz' >/dev/null 2>&1 && break
-      sleep 2
-    done
-    echo "  apiserver back up (or timed out waiting — check manually if apply seems incomplete)"
+    if ! patch_manifest_flag "Part 3 (oidc-issuer-url)" \
+      "s#- kube-apiserver#- kube-apiserver\n    - --oidc-issuer-url=${DEX_ISSUER}\n    - --oidc-client-id=zt-lab-kubectl\n    - --oidc-username-claim=email\n    - --oidc-username-prefix=oidc:\n    - --oidc-ca-file=${DEX_CA_PATH}#"; then
+      echo "[c1-l1] FAILED at Part 3 — aborting rest of apply"
+      exit 1
+    fi
+    echo "  Part 3 APPLIED — apiserver now validates Dex-issued OIDC tokens (unblocks A2-t2)"
   fi
-  echo "  Part 3 APPLIED — apiserver now validates Dex-issued OIDC tokens (unblocks A2-t2)"
 fi
 
 # ── Part 4: VPC-segmentation proxy (Cilium host-policy node segmentation) ───

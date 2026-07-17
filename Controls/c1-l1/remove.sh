@@ -36,6 +36,7 @@ if docker exec "$CP_CONTAINER" grep -q "oidc-issuer-url" "$APISERVER_MANIFEST" 2
     -e "/--oidc-client-id=/d" \
     -e "/--oidc-username-claim=/d" \
     -e "/--oidc-username-prefix=/d" \
+    -e "/--oidc-ca-file=/d" \
     "$APISERVER_MANIFEST"
   echo "  waiting for kubelet to restart apiserver..."
   for i in $(seq 1 30); do

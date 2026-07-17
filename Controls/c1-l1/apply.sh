@@ -141,16 +141,35 @@ echo "[c1-l1] Parts 1-2 APPLIED — etcd encryption + digest-pin image verificat
 
 echo "[c1-l1] [3/4] cloud-IAM proxy — wiring apiserver to Dex OIDC issuer"
 
-DEX_ISSUER="http://dex.dex.svc.cluster.local:5556/dex"
+DEX_ISSUER="https://dex.dex.svc.cluster.local:5556/dex"
 if ! kubectl get deployment dex -n dex >/dev/null 2>&1; then
   echo "  (warn) Dex deployment not found in ns=dex — is phase5 done? skipping Part 3"
 else
   if docker exec "$CP_CONTAINER" grep -q "oidc-issuer-url" "$APISERVER_MANIFEST" 2>/dev/null; then
     echo "  apiserver manifest already has --oidc-issuer-url — skipping edit"
   else
+    # CORRECTED (real run failure): DEX_ISSUER used to be "http://..." —
+    # kube-apiserver hard-requires https:// for --oidc-issuer-url (validated
+    # at startup, no override exists) and would crash-loop permanently the
+    # instant this patch landed. Dex now actually serves HTTPS (see
+    # Infra/KIND/setup.sh's phase5) with a self-signed cert stored in the
+    # "dex-tls" Secret — fetch that cert here and give the apiserver
+    # --oidc-ca-file pointing at it, or the connection will still fail
+    # (differently: a TLS trust error instead of a scheme-validation
+    # error, but still permanently broken either way).
+    DEX_CA_PATH="/etc/kubernetes/pki/dex-ca.crt"
+    echo "  fetching Dex's self-signed cert (acts as its own CA) into ${CP_CONTAINER}:${DEX_CA_PATH}"
+    if ! kubectl get secret dex-tls -n dex -o jsonpath='{.data.tls\.crt}' 2>/dev/null \
+         | base64 -d | docker exec -i "$CP_CONTAINER" sh -c "cat > ${DEX_CA_PATH}"; then
+      echo "  (warn) could not fetch dex-tls secret — --oidc-ca-file will point at a " \
+           "path that doesn't exist, and the apiserver will fail to trust Dex's cert. " \
+           "Check 'kubectl get secret dex-tls -n dex' was actually created by phase5."
+    else
+      docker exec "$CP_CONTAINER" chmod 644 "$DEX_CA_PATH"
+    fi
     echo "  patching $APISERVER_MANIFEST to add --oidc-issuer-url=${DEX_ISSUER}"
     docker exec "$CP_CONTAINER" sed -i \
-      "s#- kube-apiserver#- kube-apiserver\n    - --oidc-issuer-url=${DEX_ISSUER}\n    - --oidc-client-id=zt-lab-kubectl\n    - --oidc-username-claim=email\n    - --oidc-username-prefix=oidc:#" \
+      "s#- kube-apiserver#- kube-apiserver\n    - --oidc-issuer-url=${DEX_ISSUER}\n    - --oidc-client-id=zt-lab-kubectl\n    - --oidc-username-claim=email\n    - --oidc-username-prefix=oidc:\n    - --oidc-ca-file=${DEX_CA_PATH}#" \
       "$APISERVER_MANIFEST"
     echo "  waiting for kubelet to restart apiserver (manifest-watch triggers automatically)..."
     for i in $(seq 1 30); do

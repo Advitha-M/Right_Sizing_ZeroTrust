@@ -287,6 +287,23 @@ phase5(){
   # against that repo's docs if the chart's value schema has moved on.
   helm repo add spiffe https://spiffe.github.io/helm-charts-hardened/ >/dev/null 2>&1
   helm repo update >/dev/null
+
+  # CORRECTED (real run failure): the "spire" chart bundles ClusterSPIFFEID/
+  # ClusterFederatedTrustDomain/ClusterStaticEntry CR *instances* alongside
+  # the main install, but expects their CRD *definitions* to already exist
+  # — a single `helm upgrade --install spire` on a truly fresh cluster
+  # fails with "no matches for kind ClusterSPIFFEID ... ensure CRDs are
+  # installed first" every time. This repo (spiffe/helm-charts-hardened)
+  # publishes a dedicated "spire-crds" chart specifically for this —
+  # install it first (it contains ONLY the CRD definitions, so it can't
+  # hit this race at all), then the main chart installs cleanly in one
+  # shot afterward.
+  helm upgrade --install spire-crds spiffe/spire-crds \
+    --namespace spire --create-namespace --wait --timeout 2m \
+    || echo "       (warn) spire-crds install issue — the main spire " \
+            "install below will very likely fail too; check " \
+            "'kubectl get crd | grep spire.spiffe.io'"
+
   helm upgrade --install spire spiffe/spire \
     --namespace spire --create-namespace \
     --set global.spire.trustDomain=cluster.local \
@@ -307,6 +324,33 @@ phase5(){
   # ID-token expiry so attack2.sh's t2-oidc-token-replay doesn't have to
   # wait long for a captured token to actually expire.
   kubectl create namespace dex --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+  # CORRECTED (real run failure): Dex was previously plain HTTP only, and
+  # Controls/c1-l1/apply.sh's DEX_ISSUER was "http://...". Kubernetes hard-
+  # requires --oidc-issuer-url to use https:// — validated at kube-apiserver
+  # startup, no flag exists to relax this — so the moment C1 patched that
+  # flag into the live apiserver manifest, the apiserver failed validation
+  # and never came back up. This is what actually broke a real smoke-test
+  # run (looked identical to a resource-exhaustion stall at first: healthy,
+  # then permanently unreachable, but the timing traced exactly to this
+  # patch, not disk/memory pressure). Self-signed cert below (SAN-based —
+  # CN-only certs are rejected by kube-apiserver's Go TLS client) + HTTPS
+  # termination in Dex itself + a Secret holding it that c1-l1/apply.sh
+  # reads to trust it via --oidc-ca-file. This is the correct fix, not a
+  # workaround — there's no legitimate way to bypass the HTTPS requirement
+  # for a study whose whole subject is Zero Trust security controls.
+  step "Generating Dex's self-signed TLS cert (dex.dex.svc.cluster.local)"
+  DEX_TLS_DIR="$(mktemp -d)"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    -keyout "${DEX_TLS_DIR}/tls.key" -out "${DEX_TLS_DIR}/tls.crt" \
+    -subj "/CN=dex.dex.svc.cluster.local" \
+    -addext "subjectAltName=DNS:dex.dex.svc.cluster.local,DNS:dex.dex.svc,DNS:dex" \
+    2>/dev/null || echo "       (warn) openssl cert generation failed — Dex/L1 OIDC will not work without this"
+  kubectl create secret tls dex-tls -n dex \
+    --cert="${DEX_TLS_DIR}/tls.crt" --key="${DEX_TLS_DIR}/tls.key" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  rm -rf "${DEX_TLS_DIR}"
+
   cat <<'DEXCFG' | kubectl apply -f - >/dev/null
 apiVersion: v1
 kind: ConfigMap
@@ -315,11 +359,13 @@ metadata:
   namespace: dex
 data:
   config.yaml: |
-    issuer: http://dex.dex.svc.cluster.local:5556/dex
+    issuer: https://dex.dex.svc.cluster.local:5556/dex
     storage:
       type: memory
     web:
-      http: 0.0.0.0:5556
+      https: 0.0.0.0:5556
+      tlsCert: /etc/dex/tls/tls.crt
+      tlsKey: /etc/dex/tls/tls.key
     oauth2:
       responseTypes: ["code", "token", "id_token"]
       skipApprovalScreen: true
@@ -361,9 +407,12 @@ spec:
           ports: [{ containerPort: 5556 }]
           volumeMounts:
             - { name: config, mountPath: /etc/dex/cfg }
+            - { name: tls, mountPath: /etc/dex/tls, readOnly: true }
       volumes:
         - name: config
           configMap: { name: dex-config }
+        - name: tls
+          secret: { secretName: dex-tls }
 ---
 apiVersion: v1
 kind: Service

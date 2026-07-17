@@ -878,13 +878,21 @@ def run_pre_trial_gate(config_label: str, doc_class: str) -> bool:
 # ── Control management ────────────────────────────────────────────────────────
 
 def set_config(target_layers, applied):
+    """Returns (applied, ok). ok=False means an apply/remove script failed
+    (non-zero rc) — the caller must NOT proceed to run_trials() for this
+    condition; the cluster may be in a broken or inconsistent state, and
+    the specific failure has already been logged here with its script
+    output, rather than being discovered indirectly via generic Tier 1
+    failures a step later."""
+    ok = True
     target = set(target_layers)
     for lid in reversed([l for l, _n, _d in C.LAYERS]):
         if lid in applied and lid not in target:
             log(f"  removing {lid}")
             rc, out, _ = run(f"bash {C.remove_script(lid)}", timeout=360)
             if rc != 0:
-                log(f"  WARN remove {lid} rc={rc}")
+                log(f"  FAIL remove {lid} rc={rc}:\n{out[-400:]}")
+                ok = False
             applied.discard(lid)
     for lid, _name, _d in C.LAYERS:
         if lid in target and lid not in applied:
@@ -892,9 +900,11 @@ def set_config(target_layers, applied):
             timeout = 480 if lid == "L6" else 360
             rc, out, _ = run(f"bash {C.apply_script(lid)}", timeout=timeout)
             if rc != 0:
-                log(f"  WARN apply {lid} rc={rc}:\n{out[-400:]}")
-            applied.add(lid)
-    return applied
+                log(f"  FAIL apply {lid} rc={rc}:\n{out[-400:]}")
+                ok = False
+            else:
+                applied.add(lid)
+    return applied, ok
 
 
 def wait_stable(seconds=25):
@@ -921,12 +931,14 @@ def set_config_k3s(target_layers, applied):
     """
     k3s_env = {"KUBECONFIG": str(C.K3S_KUBECONFIG)}
     target = set(target_layers)
+    ok = True
     for lid in reversed([l for l, _n, _d in C.K3S_LAYERS]):
         if lid in applied and lid not in target:
             log(f"  [k3s] removing {lid}")
             rc, out, _ = run(f"bash {C.remove_script_k3s(lid)}", timeout=360, env=k3s_env)
             if rc != 0:
-                log(f"  [k3s] WARN remove {lid} rc={rc}")
+                log(f"  [k3s] FAIL remove {lid} rc={rc}:\n{out[-400:]}")
+                ok = False
             applied.discard(lid)
     for lid, _name, _d in C.K3S_LAYERS:
         if lid in target and lid not in applied:
@@ -934,9 +946,11 @@ def set_config_k3s(target_layers, applied):
             timeout = 480 if lid == "L6" else 360
             rc, out, _ = run(f"bash {C.apply_script_k3s(lid)}", timeout=timeout, env=k3s_env)
             if rc != 0:
-                log(f"  [k3s] WARN apply {lid} rc={rc}:\n{out[-400:]}")
-            applied.add(lid)
-    return applied
+                log(f"  [k3s] FAIL apply {lid} rc={rc}:\n{out[-400:]}")
+                ok = False
+            else:
+                applied.add(lid)
+    return applied, ok
 
 
 # ── Real-cluster-state detection (resumability fix) ─────────────────────────
@@ -1431,7 +1445,10 @@ def run_sequential(con, args, run_id):
             log(f"skip unknown config {cfg}")
             continue
         log(f"\n### CONFIG {cfg} — layers {CONFIGS[cfg]} ###")
-        applied = set_config(CONFIGS[cfg], applied)
+        applied, ok = set_config(CONFIGS[cfg], applied)
+        if not ok:
+            log(f"  HALTING config {cfg} — apply/remove failed before any invariant check ran")
+            continue
         wait_stable()
         run_trials(con, run_id, cfg, CONFIGS[cfg], args.attacks, args.trials, args)
     return applied
@@ -1468,9 +1485,11 @@ def run_mc_pairs(con, args, run_id):
         ]
         for config_label, layers in points:
             log(f"\n### MC {config_label} — layers {layers} ###")
-            applied = set_config(layers, applied)
+            applied, ok = set_config(layers, applied)
+            if not ok:
+                log(f"  HALTING {config_label} — apply/remove failed before any invariant check ran")
+                continue
             wait_stable()
-            # config column stores config_label (starts with "shapley_" not "C\d")
             run_trials(con, run_id, config_label, layers,
                        args.attacks, args.trials, args)
     return applied
@@ -1586,7 +1605,10 @@ def run_dl_robust(con, args, run_id):
                     ]
                     for config_label, layers in points:
                         log(f"\n### DL-ROBUST [k3s] {config_label} — layers {layers} ###")
-                        applied_k3s = set_config_k3s(layers, applied_k3s)
+                        applied_k3s, ok = set_config_k3s(layers, applied_k3s)
+                        if not ok:
+                            log(f"  HALTING {config_label} — apply/remove failed before any invariant check ran")
+                            continue
                         wait_stable()
                         run_trials(con, run_id, config_label, layers,
                                    args.attacks, args.trials, args, on_k3s=True)
@@ -1611,7 +1633,10 @@ def run_dl_robust(con, args, run_id):
             ]
             for config_label, layers in points:
                 log(f"\n### DL-ROBUST {config_label} — layers {layers} ###")
-                applied = set_config(layers, applied)
+                applied, ok = set_config(layers, applied)
+                if not ok:
+                    log(f"  HALTING {config_label} — apply/remove failed before any invariant check ran")
+                    continue
                 wait_stable()
                 run_trials(con, run_id, config_label, layers,
                            args.attacks, args.trials, args)
@@ -1674,7 +1699,10 @@ def run_l2_l3a_sep(con, args, run_id):
             ]
             for config_label, layers in points:
                 log(f"\n### L2L3A-SEP {config_label} — layers {layers} ###")
-                applied = set_config_k3s(layers, applied)
+                applied, ok = set_config_k3s(layers, applied)
+                if not ok:
+                    log(f"  HALTING {config_label} — apply/remove failed before any invariant check ran")
+                    continue
                 wait_stable()
                 run_trials(con, run_id, config_label, layers,
                            args.attacks, args.trials, args, on_k3s=True)
